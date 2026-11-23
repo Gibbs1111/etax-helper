@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         eTax Helper Internal
 // @namespace    https://etax-helper.internal/userscript
-// @version      2.0.2
+// @version      2.0.3
 // @description  Hỗ trợ nghiệp vụ kế toán nội bộ trên Cổng Dịch vụ công Thuế & eTax (MST mã hóa PIN, Chọn ngày 2 cấp, Mở rộng bảng, Đồng hồ giữ phiên, Unified Dock định danh & Ghi chú, Trợ lý MC/TM & đối soát Xanh/Đỏ, Truy cập nhanh & Ghim tờ khai, Trạng thái CT SigningHub & eSigner)
 // @author       Internal Accounting Tech Team
 // @match        https://dichvucong.gdt.gov.vn/*
@@ -46,6 +46,7 @@ const STORAGE_KEYS = {
   SIGNING_CONFIG: 'etax_signing_config_v1',
   ACTIVE_COMPANY_CTX: 'etax_active_company_v2',
   OPEN_QUICK_ACCESS_EVT: 'etax_open_quick_access_evt_v2',
+  UNLOCK_SESSION: 'etax_unlock_session_v2',
 };
 
 const memoryFallback = new Map();
@@ -1136,77 +1137,60 @@ async function unlockEncryptedVault(pin, vaultRecord) {
 
   "security/session-unlock.js": function(__require, __exports) {
 const { bytesToBase64, base64ToBytes, exportAesKeyB64, importAesKeyFromB64 } = __require("security/crypto-vault.js");
+const { STORAGE_KEYS, getValue, setValue, deleteValue, addValueChangeListener } = __require("core/storage.js");
 
 /**
- * Quản lý phiên mở khóa PIN 1 lần cho mỗi phiên mở trình duyệt:
- * - Chỉ giữ khóa AES phiên dẫn xuất (KHÔNG lưu PIN gốc, KHÔNG lưu mật khẩu plaintext) trong sessionStorage.
- * - Tự hủy 100% khi đóng trình duyệt hoặc khi bấm "Khóa ngay".
- * - Đồng bộ trạng thái mở khóa/khóa tức thì giữa các tab cùng origin qua BroadcastChannel.
+ * Quản lý phiên mở khóa PIN hiệu lực 7 ngày (1 tuần) lưu trong sandbox Tampermonkey (`GM_setValue`):
+ * - Miễn nhiễm 100% với lệnh `sessionStorage.clear()` của cổng `dichvucong.gdt.gov.vn` mỗi khi Đăng xuất/đổi công ty.
+ * - Sống xuyên qua việc đổi công ty, mở tab mới, hoặc đóng/mở lại trình duyệt trong vòng 7 ngày.
+ * - Chỉ giữ khóa AES dẫn xuất (KHÔNG lưu PIN gốc, KHÔNG lưu mật khẩu plaintext) và trang web không thể đọc được kho `GM_setValue`.
+ * - Tự động hết hạn sau đúng 7 ngày hoặc hủy tức thì trên mọi tab khi bấm "🔒 Khóa ngay".
  */
 
-const SESSION_STORAGE_KEY = '__etax_helper_session_key_v1';
-const CHANNEL_NAME = 'etax_helper_pin_sync_v1';
+const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 ngày (1 tuần)
+const LEGACY_SESSION_STORAGE_KEY = '__etax_helper_session_key_v1';
 
-let memorySession = null; // { key: CryptoKey, keyB64, saltBytes, saltB64, iterations, unlockedAt }
-let channel = null;
+let memorySession = null; // { key: CryptoKey, keyB64, saltBytes, saltB64, iterations, unlockedAt, expiresAt }
+let gmListenerId = null;
 const lockListeners = new Set();
 
-function getSessionStorageSafe() {
+function clearLegacySessionStorage() {
   try {
-    return window.sessionStorage;
+    if (typeof window !== 'undefined' && window.sessionStorage) {
+      window.sessionStorage.removeItem(LEGACY_SESSION_STORAGE_KEY);
+    }
   } catch {
+    // ignore
+  }
+}
+
+function initStorageSync() {
+  if (gmListenerId !== null) return;
+  gmListenerId = addValueChangeListener(STORAGE_KEYS.UNLOCK_SESSION, async (_k, _oldVal, newVal) => {
+    if (!newVal || !newVal.keyB64) {
+      memorySession = null;
+      for (const cb of lockListeners) cb();
+      return;
+    }
+    if (Number(newVal.expiresAt) > Date.now()) {
+      await hydrateSessionFromSerialized(newVal);
+      for (const cb of lockListeners) cb();
+    } else {
+      memorySession = null;
+      for (const cb of lockListeners) cb();
+    }
+  });
+}
+
+async function hydrateSessionFromSerialized(serialized, now = Date.now()) {
+  if (!serialized || !serialized.keyB64 || !serialized.saltB64) return null;
+  const expiresAt = Number(serialized.expiresAt || 0);
+  if (!Number.isFinite(expiresAt) || now >= expiresAt) {
+    memorySession = null;
+    deleteValue(STORAGE_KEYS.UNLOCK_SESSION);
     return null;
   }
-}
 
-function initChannel() {
-  if (channel || typeof BroadcastChannel !== 'function') return;
-  try {
-    channel = new BroadcastChannel(CHANNEL_NAME);
-    if (typeof channel.unref === 'function') {
-      channel.unref();
-    }
-    channel.onmessage = async (event) => {
-      const msg = event.data;
-      if (!msg || !msg.type) return;
-
-      if (msg.type === 'LOCK_ALL') {
-        clearLocalSessionOnly();
-        for (const cb of lockListeners) cb();
-      } else if (msg.type === 'REQUEST_KEY' && memorySession) {
-        channel.postMessage({
-          type: 'SHARE_KEY',
-          payload: {
-            keyB64: memorySession.keyB64,
-            saltB64: memorySession.saltB64,
-            iterations: memorySession.iterations,
-            unlockedAt: memorySession.unlockedAt,
-          },
-        });
-      } else if (msg.type === 'SHARE_KEY' && !memorySession && msg.payload) {
-        await hydrateSessionFromSerialized(msg.payload, false);
-        for (const cb of lockListeners) cb();
-      }
-    };
-  } catch {
-    channel = null;
-  }
-}
-
-function clearLocalSessionOnly() {
-  memorySession = null;
-  const ss = getSessionStorageSafe();
-  if (ss) {
-    try {
-      ss.removeItem(SESSION_STORAGE_KEY);
-    } catch {
-      // ignore
-    }
-  }
-}
-
-async function hydrateSessionFromSerialized(serialized, persistToStorage = true) {
-  if (!serialized || !serialized.keyB64 || !serialized.saltB64) return null;
   try {
     const key = await importAesKeyFromB64(serialized.keyB64);
     const saltBytes = base64ToBytes(serialized.saltB64);
@@ -1216,93 +1200,90 @@ async function hydrateSessionFromSerialized(serialized, persistToStorage = true)
       saltBytes,
       saltB64: serialized.saltB64,
       iterations: Number(serialized.iterations) || 310000,
-      unlockedAt: serialized.unlockedAt || Date.now(),
+      unlockedAt: Number(serialized.unlockedAt) || now,
+      expiresAt,
     };
-    if (persistToStorage) {
-      const ss = getSessionStorageSafe();
-      if (ss) {
-        ss.setItem(SESSION_STORAGE_KEY, JSON.stringify(serialized));
-      }
-    }
     return memorySession;
   } catch {
-    clearLocalSessionOnly();
+    memorySession = null;
+    deleteValue(STORAGE_KEYS.UNLOCK_SESSION);
     return null;
   }
 }
 
-async function saveUnlockedSession({ key, saltBytes, iterations }) {
-  initChannel();
+async function saveUnlockedSession({
+  key,
+  saltBytes,
+  iterations,
+  now = Date.now(),
+  ttlMs = SESSION_TTL_MS,
+}) {
+  initStorageSync();
+  clearLegacySessionStorage();
+
   const keyB64 = await exportAesKeyB64(key);
   const saltB64 = bytesToBase64(saltBytes);
   const serialized = {
+    schemaVersion: 2,
     keyB64,
     saltB64,
-    iterations,
-    unlockedAt: Date.now(),
+    iterations: Number(iterations) || 310000,
+    unlockedAt: now,
+    expiresAt: now + ttlMs,
   };
-  await hydrateSessionFromSerialized(serialized, true);
-  if (channel) {
-    try {
-      channel.postMessage({ type: 'SHARE_KEY', payload: serialized });
-    } catch {
-      // ignore
-    }
-  }
+
+  setValue(STORAGE_KEYS.UNLOCK_SESSION, serialized);
+  await hydrateSessionFromSerialized(serialized, now);
   return memorySession;
 }
 
-async function getActiveSession() {
-  initChannel();
-  if (memorySession) return memorySession;
+async function getActiveSession(now = Date.now()) {
+  initStorageSync();
 
-  const ss = getSessionStorageSafe();
-  if (ss) {
-    try {
-      const raw = ss.getItem(SESSION_STORAGE_KEY);
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        return await hydrateSessionFromSerialized(parsed, false);
-      }
-    } catch {
-      clearLocalSessionOnly();
+  if (memorySession) {
+    if (now < memorySession.expiresAt) {
+      return memorySession;
     }
+    memorySession = null;
+    deleteValue(STORAGE_KEYS.UNLOCK_SESSION);
+    return null;
   }
 
-  // Hỏi nhanh các tab khác đang mở trên cùng origin xem đã mở khóa trong phiên này chưa
-  if (channel) {
-    try {
-      channel.postMessage({ type: 'REQUEST_KEY' });
-    } catch {
-      // ignore
-    }
+  const saved = getValue(STORAGE_KEYS.UNLOCK_SESSION, null);
+  if (saved && typeof saved === 'object') {
+    return hydrateSessionFromSerialized(saved, now);
   }
+
   return null;
 }
 
+/**
+ * Xóa bản nhớ RAM cục bộ (hữu ích cho Unit Test giả lập đóng tab / reload mà vẫn giữ kho GM_setValue).
+ */
+function resetMemorySessionOnly() {
+  memorySession = null;
+}
+
 function lockSessionNow() {
-  initChannel();
-  clearLocalSessionOnly();
-  if (channel) {
-    try {
-      channel.postMessage({ type: 'LOCK_ALL' });
-    } catch {
-      // ignore
-    }
-  }
+  initStorageSync();
+  memorySession = null;
+  clearLegacySessionStorage();
+  deleteValue(STORAGE_KEYS.UNLOCK_SESSION);
   for (const cb of lockListeners) cb();
 }
 
 function onSessionStateChange(callback) {
-  initChannel();
+  initStorageSync();
   lockListeners.add(callback);
   return () => lockListeners.delete(callback);
 }
 
   __exports.saveUnlockedSession = saveUnlockedSession;
   __exports.getActiveSession = getActiveSession;
+  __exports.resetMemorySessionOnly = resetMemorySessionOnly;
   __exports.lockSessionNow = lockSessionNow;
   __exports.onSessionStateChange = onSessionStateChange;
+  __exports.SESSION_TTL_MS = SESSION_TTL_MS;
   },
 
   "features/session-timer/network-probe.js": function(__require, __exports) {
@@ -3050,7 +3031,7 @@ function openCompanyManagerModal({
       <h3 style="margin:0 0 6px; font-size:14px; color:#006FBC;">🔐 Thiết lập mã PIN bảo vệ dữ liệu cục bộ</h3>
       <p class="eh-muted" style="margin:0 0 12px; line-height:1.5;">
         Toàn bộ Mã số thuế, Tài khoản và Mật khẩu khách hàng được <strong>mã hóa AES-256-GCM ngay trên trình duyệt của bạn</strong>, tuyệt đối không gửi ra ngoài.<br/>
-        Bạn chỉ cần nhập mã PIN này <strong>1 lần mỗi phiên mở trình duyệt</strong> để dùng cả ngày.
+        Bạn chỉ cần nhập mã PIN này <strong>1 lần mỗi tuần (7 ngày)</strong>, tự giữ xuyên suốt khi đổi công ty hoặc mở lại trình duyệt (có thể bấm 🔒 Khóa ngay bất kỳ lúc nào).
       </p>
       <div class="eh-grid-2">
         <div class="eh-field">
@@ -3871,7 +3852,7 @@ function createQuickLoginFeature() {
     } else if (vaultState === 'locked') {
       bodyHtml = `
         <div class="eh-pin-row">
-          <input type="password" class="eh-input" id="eh-ql-pin-input" placeholder="Nhập mã PIN mở khóa (1 lần dùng cả ngày)..." autocomplete="current-password"/>
+          <input type="password" class="eh-input" id="eh-ql-pin-input" placeholder="Nhập mã PIN mở khóa (nhớ 7 ngày)..." autocomplete="current-password"/>
           <button type="button" class="eh-btn eh-btn-primary" id="eh-ql-pin-unlock" style="white-space:nowrap;">Mở khóa</button>
         </div>
         <div style="margin-top:6px; display:flex; justify-content:space-between; align-items:center;">
@@ -6680,7 +6661,7 @@ function createCompanyBarFeature() {
     const bodyHtml = showPinGate
       ? `
         <div style="margin-bottom:8px; font-size:12px; color:#475569;">
-          Kho MST đang khóa. Nhập mã PIN 1 lần để xem &amp; sửa ghi chú đồng bộ với Kho MST v1:
+          Kho MST đang khóa. Nhập mã PIN (nhớ 7 ngày) để xem &amp; sửa ghi chú đồng bộ với Kho MST:
         </div>
         <div style="display:flex; gap:6px; align-items:center;">
           <input type="password" class="eh-input" id="eh-co-pin" placeholder="Nhập mã PIN mở khóa..." autocomplete="current-password"/>
