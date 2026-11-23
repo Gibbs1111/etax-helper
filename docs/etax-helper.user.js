@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         eTax Helper Internal
 // @namespace    https://etax-helper.internal/userscript
-// @version      2.0.0
+// @version      2.0.1
 // @description  Hỗ trợ nghiệp vụ kế toán nội bộ trên Cổng Dịch vụ công Thuế & eTax (MST mã hóa PIN, Chọn ngày 2 cấp, Mở rộng bảng, Đồng hồ giữ phiên, Unified Dock định danh & Ghi chú, Trợ lý MC/TM & đối soát Xanh/Đỏ, Truy cập nhanh & Ghim tờ khai, Trạng thái CT SigningHub & eSigner)
 // @author       Internal Accounting Tech Team
 // @match        https://dichvucong.gdt.gov.vn/*
@@ -1620,7 +1620,35 @@ function createShadowMount(tagName = 'div', extraCss = '', hostAttributes = {}, 
   const root = document.createElement('div');
   shadow.appendChild(root);
 
-  let cleanup = () => {};
+  // Chặn rò sự kiện bàn phím (`keydown`/`keypress`/`keyup`) từ các ô nhập bên trong Shadow DOM ra trang ngoài.
+  // Tránh lỗi Event Retargeting (`event.target` biến thành `DIV`) khiến script cũ của cổng thuế (VD: chặn Backspace
+  // trên `thuedientu.gdt.gov.vn`) vô tình khóa thao tác gõ/xóa của kế toán.
+  const isEditableOrigin = (event) => {
+    const first =
+      typeof event.composedPath === 'function' && event.composedPath().length > 0
+        ? event.composedPath()[0]
+        : event.target;
+    if (!first || !first.tagName) return false;
+    const tag = String(first.tagName).toUpperCase();
+    return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || Boolean(first.isContentEditable);
+  };
+
+  const onEditableKeyLeak = (event) => {
+    if (event.key === 'Escape') return;
+    if (isEditableOrigin(event)) {
+      event.stopPropagation();
+    }
+  };
+
+  host.addEventListener('keydown', onEditableKeyLeak, false);
+  host.addEventListener('keypress', onEditableKeyLeak, false);
+  host.addEventListener('keyup', onEditableKeyLeak, false);
+
+  let cleanup = () => {
+    host.removeEventListener('keydown', onEditableKeyLeak, false);
+    host.removeEventListener('keypress', onEditableKeyLeak, false);
+    host.removeEventListener('keyup', onEditableKeyLeak, false);
+  };
 
   if (guardBootstrapFocusTrap) {
     // Bootstrap 5 Modal (.modal.show) gắn FocusTrap trên `document` (sự kiện `focusin` & `keydown` Tab/Esc)
@@ -1659,7 +1687,9 @@ function createShadowMount(tagName = 'div', extraCss = '', hostAttributes = {}, 
     host.addEventListener('focusin', onHostFocusInBubble, false);
     host.addEventListener('keydown', onHostKeyDown, false);
 
+    const prevCleanup = cleanup;
     cleanup = () => {
+      prevCleanup();
       pageWin.removeEventListener('focusin', onWindowFocusIn, true);
       host.removeEventListener('focusin', onHostFocusInBubble, false);
       host.removeEventListener('keydown', onHostKeyDown, false);
@@ -3111,7 +3141,7 @@ function openCompanyManagerModal({
               <th style="width:110px;">Thao tác</th>
             </tr>
           </thead>
-          <tbody>
+          <tbody id="eh-list-tbody">
             ${
               filtered.length === 0
                 ? '<tr><td colspan="6" style="text-align:center; padding:18px; color:#64748b;">Chưa có công ty nào khớp tìm kiếm. Bạn có thể thêm tay phía trên hoặc chuyển sang tab <strong>Import Excel / CSV</strong>.</td></tr>'
@@ -3422,45 +3452,81 @@ function openCompanyManagerModal({
       render();
     });
 
+    const bindCompanyRowActions = (container) => {
+      container.querySelectorAll('.eh-act-edit').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          editingId = btn.dataset.id;
+          statusMsg = null;
+          render();
+        });
+      });
+
+      container.querySelectorAll('.eh-act-del').forEach((btn) => {
+        btn.addEventListener('click', async () => {
+          const target = currentCompanies.find((c) => c.id === btn.dataset.id);
+          if (!target) return;
+          if (!window.confirm(`Xóa công ty "${target.companyName}" (${target.account})?`)) return;
+          try {
+            const next = currentCompanies.filter((c) => c.id !== target.id);
+            currentCompanies = await saveCompanies(next);
+            if (editingId === target.id) editingId = null;
+            notifyParent();
+            setStatus('success', `Đã xóa "${target.companyName}".`);
+          } catch (err) {
+            setStatus('error', err.message);
+          }
+        });
+      });
+    };
+
+    const renderCompanyRowsOnly = () => {
+      const tbody = root.querySelector('#eh-list-tbody');
+      if (!tbody) return;
+      const q = normalizeVietnamese(searchQuery);
+      const filtered = currentCompanies.filter((c) => {
+        if (!q) return true;
+        return (
+          normalizeVietnamese(c.companyName).includes(q) ||
+          normalizeVietnamese(c.mst).includes(q) ||
+          normalizeVietnamese(c.account).includes(q) ||
+          normalizeVietnamese(c.note).includes(q)
+        );
+      });
+      tbody.innerHTML =
+        filtered.length === 0
+          ? '<tr><td colspan="6" style="text-align:center; padding:18px; color:#64748b;">Chưa có công ty nào khớp tìm kiếm. Bạn có thể thêm tay phía trên hoặc chuyển sang tab <strong>Import Excel / CSV</strong>.</td></tr>'
+          : filtered
+              .map(
+                (c) => `
+          <tr>
+            <td><strong>${esc(c.mst)}</strong></td>
+            <td>${esc(c.companyName)}</td>
+            <td><code>${esc(c.account)}</code></td>
+            <td>${showPasswords ? esc(c.password) : '••••••••'}</td>
+            <td class="eh-muted">${esc(c.note)}</td>
+            <td>
+              <div class="eh-flex" style="gap:4px;">
+                <button type="button" class="eh-btn eh-btn-sm eh-act-edit" data-id="${esc(c.id)}">Sửa</button>
+                <button type="button" class="eh-btn eh-btn-sm eh-btn-danger eh-act-del" data-id="${esc(c.id)}">Xóa</button>
+              </div>
+            </td>
+          </tr>`,
+              )
+              .join('');
+      bindCompanyRowActions(tbody);
+    };
+
     root.querySelector('#eh-list-search')?.addEventListener('input', (e) => {
       searchQuery = e.target.value;
-      render();
-      const el = root.querySelector('#eh-list-search');
-      if (el) {
-        el.focus();
-        el.setSelectionRange(searchQuery.length, searchQuery.length);
-      }
+      renderCompanyRowsOnly();
     });
 
     root.querySelector('#eh-toggle-show-pass')?.addEventListener('change', (e) => {
       showPasswords = e.target.checked;
-      render();
+      renderCompanyRowsOnly();
     });
 
-    root.querySelectorAll('.eh-act-edit').forEach((btn) => {
-      btn.addEventListener('click', () => {
-        editingId = btn.dataset.id;
-        statusMsg = null;
-        render();
-      });
-    });
-
-    root.querySelectorAll('.eh-act-del').forEach((btn) => {
-      btn.addEventListener('click', async () => {
-        const target = currentCompanies.find((c) => c.id === btn.dataset.id);
-        if (!target) return;
-        if (!window.confirm(`Xóa công ty "${target.companyName}" (${target.account})?`)) return;
-        try {
-          const next = currentCompanies.filter((c) => c.id !== target.id);
-          currentCompanies = await saveCompanies(next);
-          if (editingId === target.id) editingId = null;
-          notifyParent();
-          setStatus('success', `Đã xóa "${target.companyName}".`);
-        } catch (err) {
-          setStatus('error', err.message);
-        }
-      });
-    });
+    bindCompanyRowActions(root);
 
     // Import tab
     root.querySelector('#eh-btn-dl-template')?.addEventListener('click', () => {
@@ -3794,19 +3860,6 @@ function createQuickLoginFeature() {
   const renderBar = () => {
     if (!barRoot) return;
 
-    const filtered =
-      vaultState === 'unlocked'
-        ? companies.filter((c) => {
-            const q = normalizeVietnamese(searchText);
-            if (!q) return true;
-            return (
-              normalizeVietnamese(c.companyName).includes(q) ||
-              normalizeVietnamese(c.mst).includes(q) ||
-              normalizeVietnamese(c.account).includes(q)
-            );
-          })
-        : [];
-
     let bodyHtml = '';
     if (vaultState === 'uninitialized') {
       bodyHtml = `
@@ -3830,33 +3883,7 @@ function createQuickLoginFeature() {
       bodyHtml = `
         <div class="eh-search-wrap">
           <input type="text" class="eh-input" id="eh-ql-search" value="${esc(searchText)}" placeholder="🔍 Gõ tên công ty hoặc MST để chọn nhanh (${companies.length} công ty)..." autocomplete="off"/>
-          ${
-            dropdownOpen
-              ? `
-            <div class="eh-dropdown" id="eh-ql-dropdown">
-              ${
-                filtered.length === 0
-                  ? `<div style="padding:10px; text-align:center;" class="eh-muted">${
-                      companies.length === 0
-                        ? 'Danh sách đang trống — bấm nút <strong>Quản lý</strong> để thêm hoặc Import Excel.'
-                        : 'Không tìm thấy công ty phù hợp.'
-                    }</div>`
-                  : filtered
-                      .slice(0, 60)
-                      .map(
-                        (c) => `
-                  <div class="eh-dd-item" data-id="${esc(c.id)}">
-                    <div class="eh-dd-name">${esc(c.companyName)}</div>
-                    <div class="eh-dd-sub">Tài khoản: <strong>${esc(c.account || `${c.mst}-QL`)}</strong> · MST: ${esc(c.mst)}</div>
-                    ${showNotes && c.note ? `<div class="eh-dd-note">${esc(c.note)}</div>` : ''}
-                  </div>`,
-                      )
-                      .join('')
-              }
-            </div>
-          `
-              : ''
-          }
+          <div id="eh-ql-dropdown-slot"></div>
         </div>
       `;
     }
@@ -3880,13 +3907,74 @@ function createQuickLoginFeature() {
           </div>
         </div>
         ${bodyHtml}
-        ${
-          feedbackMsg
-            ? `<div class="${feedbackMsg.type === 'error' ? 'eh-error' : 'eh-success'}" style="margin-top:8px;">${esc(feedbackMsg.text)}</div>`
-            : ''
-        }
+        <div id="eh-ql-feedback-slot">
+          ${
+            feedbackMsg
+              ? `<div class="${feedbackMsg.type === 'error' ? 'eh-error' : 'eh-success'}" style="margin-top:8px;">${esc(feedbackMsg.text)}</div>`
+              : ''
+          }
+        </div>
       </div>
     `;
+
+    // Chỉ cập nhật riêng danh sách dropdown (KHÔNG vẽ lại `#eh-ql-search`) để giữ nguyên con trỏ & gõ tiếng Việt mượt
+    const renderDropdownOnly = () => {
+      const slot = barRoot.querySelector('#eh-ql-dropdown-slot');
+      const fbSlot = barRoot.querySelector('#eh-ql-feedback-slot');
+      if (fbSlot) {
+        fbSlot.innerHTML = feedbackMsg
+          ? `<div class="${feedbackMsg.type === 'error' ? 'eh-error' : 'eh-success'}" style="margin-top:8px;">${esc(feedbackMsg.text)}</div>`
+          : '';
+      }
+      if (!slot) return;
+      if (!dropdownOpen) {
+        slot.innerHTML = '';
+        return;
+      }
+      const q = normalizeVietnamese(searchText);
+      const list = companies.filter((c) => {
+        if (!q) return true;
+        return (
+          normalizeVietnamese(c.companyName).includes(q) ||
+          normalizeVietnamese(c.mst).includes(q) ||
+          normalizeVietnamese(c.account).includes(q)
+        );
+      });
+      slot.innerHTML = `
+        <div class="eh-dropdown" id="eh-ql-dropdown">
+          ${
+            list.length === 0
+              ? `<div style="padding:10px; text-align:center;" class="eh-muted">${
+                  companies.length === 0
+                    ? 'Danh sách đang trống — bấm nút <strong>Quản lý</strong> để thêm hoặc Import Excel.'
+                    : 'Không tìm thấy công ty phù hợp.'
+                }</div>`
+              : list
+                  .slice(0, 60)
+                  .map(
+                    (c) => `
+              <div class="eh-dd-item" data-id="${esc(c.id)}">
+                <div class="eh-dd-name">${esc(c.companyName)}</div>
+                <div class="eh-dd-sub">Tài khoản: <strong>${esc(c.account || `${c.mst}-QL`)}</strong> · MST: ${esc(c.mst)}</div>
+                ${showNotes && c.note ? `<div class="eh-dd-note">${esc(c.note)}</div>` : ''}
+              </div>`,
+                  )
+                  .join('')
+          }
+        </div>
+      `;
+      slot.querySelectorAll('.eh-dd-item').forEach((itemEl) => {
+        itemEl.addEventListener('mousedown', (e) => {
+          e.preventDefault();
+          const target = companies.find((c) => c.id === itemEl.dataset.id);
+          if (target) applyCompanyToForm(target);
+        });
+      });
+    };
+
+    if (vaultState === 'unlocked') {
+      renderDropdownOnly();
+    }
 
     // Bind events
     barRoot.querySelector('#eh-ql-setup')?.addEventListener('click', () => {
@@ -3955,36 +4043,22 @@ function createQuickLoginFeature() {
       searchInput.addEventListener('focus', () => {
         if (!dropdownOpen) {
           dropdownOpen = true;
-          renderBar();
-          const el = barRoot.querySelector('#eh-ql-search');
-          el?.focus();
-          el?.setSelectionRange(searchText.length, searchText.length);
+          renderDropdownOnly();
         }
       });
       searchInput.addEventListener('input', (e) => {
         searchText = e.target.value;
         dropdownOpen = true;
         feedbackMsg = null;
-        renderBar();
-        const el = barRoot.querySelector('#eh-ql-search');
-        el?.focus();
-        el?.setSelectionRange(searchText.length, searchText.length);
+        renderDropdownOnly();
       });
       searchInput.addEventListener('keydown', (e) => {
         if (e.key === 'Escape') {
           dropdownOpen = false;
-          renderBar();
+          renderDropdownOnly();
         }
       });
     }
-
-    barRoot.querySelectorAll('.eh-dd-item').forEach((itemEl) => {
-      itemEl.addEventListener('mousedown', (e) => {
-        e.preventDefault();
-        const target = companies.find((c) => c.id === itemEl.dataset.id);
-        if (target) applyCompanyToForm(target);
-      });
-    });
   };
 
   const onDocumentClick = (e) => {
@@ -7409,8 +7483,24 @@ function createTaxCodeHelperFeature() {
     const { host, root, cleanup } = createShadowMount('div', PICKER_POP_CSS, {
       'data-etax-role': 'tax-code-picker',
     });
+
+    // Lớp bảo vệ 1: Chặn sự kiện bàn phím nổi ra ngoài Shadow DOM (`target` bị đổi thành `DIV`)
+    // để tránh script cũ của `thuedientu.gdt.gov.vn` chặn phím Backspace (`keyCode === 8`).
+    const stopKeyLeak = (e) => {
+      if (e.key === 'Escape') return;
+      e.stopPropagation();
+    };
+    host.addEventListener('keydown', stopKeyLeak, false);
+    host.addEventListener('keypress', stopKeyLeak, false);
+    host.addEventListener('keyup', stopKeyLeak, false);
+
     activePickerHost = host;
-    activePickerCleanup = cleanup;
+    activePickerCleanup = () => {
+      host.removeEventListener('keydown', stopKeyLeak, false);
+      host.removeEventListener('keypress', stopKeyLeak, false);
+      host.removeEventListener('keyup', stopKeyLeak, false);
+      cleanup();
+    };
     document.body.appendChild(host);
 
     let searchQuery = '';
@@ -7431,121 +7521,110 @@ function createTaxCodeHelperFeature() {
       popEl.style.top = `${Math.round(top)}px`;
     };
 
-    const render = () => {
+    let baseItems = kind === 'ndkt' ? catalog.ndktList : catalog.chapterList;
+    if (kind === 'chapter' && (rememberedChapter || initialPortalChapter)) {
+      baseItems = [...baseItems].sort((a, b) => {
+        const score = (c) =>
+          c.code === rememberedChapter ? 3 : c.code === initialPortalChapter ? 2 : 0;
+        return score(b) - score(a);
+      });
+    }
+
+    const title =
+      kind === 'ndkt'
+        ? '🔎 Trợ lý Mã Tiểu mục (NDKT) — Chọn nhanh & Đối soát'
+        : '🔎 Trợ lý Mã Chương — Chọn nhanh & Đối soát';
+
+    // Lớp bảo vệ 2: Render khung Popover & ô <input> DUY NHẤT 1 LẦN,
+    // khi gõ/xóa chỉ cập nhật riêng `.eh-tc-list` để không làm mất selection/IME tiếng Việt!
+    root.innerHTML = `
+      <div class="eh-tc-pop" id="eh-tc-pop">
+        <div class="eh-tc-pop-head">
+          <div class="eh-tc-pop-title">${title}</div>
+          <button type="button" class="eh-btn eh-btn-sm" id="eh-tc-close">Đóng</button>
+        </div>
+        <div class="eh-tc-status-box ${validation.status}">
+          <strong>${
+            validation.status === 'green'
+              ? '🟢'
+              : validation.status === 'red'
+                ? '🔴'
+                : validation.status === 'yellow'
+                  ? '🟡'
+                  : '⚪'
+          } ${esc(validation.summary)}</strong><br/>
+          <span>${esc(validation.detail)}</span>
+        </div>
+        <div class="eh-tc-search-bar" style="display:flex; align-items:center; gap:6px;">
+          <input type="text" class="eh-input" id="eh-tc-search" value=""
+            placeholder="${
+              kind === 'ndkt'
+                ? 'Gõ mã (1701, 1052, 2862) hoặc tên không dấu (gtgt, mon bai, cham nop)...'
+                : 'Gõ mã Chương (854, 754, 554, 557) hoặc cấp quản lý...'
+            }" autocomplete="off" style="flex:1;"/>
+          <button type="button" class="eh-btn eh-btn-sm" id="eh-tc-clear" title="Xóa nhanh ô tìm kiếm" style="display:none;">✕</button>
+        </div>
+        <div class="eh-tc-list" id="eh-tc-list"></div>
+        <div class="eh-tc-foot">
+          <span>${
+            kind === 'ndkt'
+              ? `Danh mục: ${catalog.ndktList.length} mã (${catalog.portalSyncedCount} đã đồng bộ từ Thuế)`
+              : `Danh mục: ${catalog.chapterList.length} Mã Chương phổ biến`
+          }</span>
+          ${
+            kind === 'ndkt' && row.tieuMucImg
+              ? '<button type="button" class="eh-btn eh-btn-sm" id="eh-tc-open-native">🔄 Mở tra cứu Thuế để đồng bộ</button>'
+              : ''
+          }
+        </div>
+      </div>
+    `;
+
+    const popEl = root.querySelector('#eh-tc-pop');
+    if (popEl) positionPop(popEl);
+
+    const listEl = root.querySelector('#eh-tc-list');
+    const searchEl = root.querySelector('#eh-tc-search');
+    const clearBtn = root.querySelector('#eh-tc-clear');
+
+    const renderList = () => {
+      if (!listEl) return;
+      if (clearBtn) clearBtn.style.display = searchQuery ? 'inline-flex' : 'none';
+
       const q = normalizeVietnamese(searchQuery);
-      let items = kind === 'ndkt' ? catalog.ndktList : catalog.chapterList;
-
-      if (kind === 'chapter' && (rememberedChapter || initialPortalChapter)) {
-        items = [...items].sort((a, b) => {
-          const score = (c) =>
-            c.code === rememberedChapter ? 3 : c.code === initialPortalChapter ? 2 : 0;
-          return score(b) - score(a);
-        });
-      }
-
       const filtered = q
-        ? items.filter(
+        ? baseItems.filter(
             (it) =>
               it.code.includes(q) || normalizeVietnamese(it.name).includes(q),
           )
-        : items;
+        : baseItems;
 
-      const title =
-        kind === 'ndkt'
-          ? '🔎 Trợ lý Mã Tiểu mục (NDKT) — Chọn nhanh & Đối soát'
-          : '🔎 Trợ lý Mã Chương — Chọn nhanh & Đối soát';
+      listEl.innerHTML =
+        filtered.length === 0
+          ? '<div style="padding:14px; text-align:center;" class="eh-muted">Không tìm thấy mã phù hợp.</div>'
+          : filtered
+              .slice(0, 80)
+              .map((it) => {
+                const badges = [];
+                if (kind === 'chapter' && it.code === rememberedChapter) {
+                  badges.push('<span class="eh-tc-tag eh-tc-tag-mst">MST hay dùng</span>');
+                }
+                if (kind === 'chapter' && it.code === initialPortalChapter) {
+                  badges.push('<span class="eh-tc-tag">Mặc định cổng thuế</span>');
+                }
+                if (kind === 'ndkt' && it.fromPortal) {
+                  badges.push('<span class="eh-tc-tag">Đồng bộ Thuế</span>');
+                }
+                return `
+                  <div class="eh-tc-item" data-code="${esc(it.code)}">
+                    <div class="eh-tc-code">${esc(it.code)}</div>
+                    <div class="eh-tc-name">${esc(it.name)}${badges.join('')}</div>
+                  </div>
+                `;
+              })
+              .join('');
 
-      root.innerHTML = `
-        <div class="eh-tc-pop" id="eh-tc-pop">
-          <div class="eh-tc-pop-head">
-            <div class="eh-tc-pop-title">${title}</div>
-            <button type="button" class="eh-btn eh-btn-sm" id="eh-tc-close">Đóng</button>
-          </div>
-          <div class="eh-tc-status-box ${validation.status}">
-            <strong>${
-              validation.status === 'green'
-                ? '🟢'
-                : validation.status === 'red'
-                  ? '🔴'
-                  : validation.status === 'yellow'
-                    ? '🟡'
-                    : '⚪'
-            } ${esc(validation.summary)}</strong><br/>
-            <span>${esc(validation.detail)}</span>
-          </div>
-          <div class="eh-tc-search-bar">
-            <input type="text" class="eh-input" id="eh-tc-search" value="${esc(searchQuery)}"
-              placeholder="${
-                kind === 'ndkt'
-                  ? 'Gõ mã (1701, 1052, 2862) hoặc tên không dấu (gtgt, mon bai, cham nop)...'
-                  : 'Gõ mã Chương (854, 754, 554, 557) hoặc cấp quản lý...'
-              }" autocomplete="off"/>
-          </div>
-          <div class="eh-tc-list">
-            ${
-              filtered.length === 0
-                ? '<div style="padding:14px; text-align:center;" class="eh-muted">Không tìm thấy mã phù hợp.</div>'
-                : filtered
-                    .slice(0, 80)
-                    .map((it) => {
-                      const badges = [];
-                      if (kind === 'chapter' && it.code === rememberedChapter) {
-                        badges.push('<span class="eh-tc-tag eh-tc-tag-mst">MST hay dùng</span>');
-                      }
-                      if (kind === 'chapter' && it.code === initialPortalChapter) {
-                        badges.push('<span class="eh-tc-tag">Mặc định cổng thuế</span>');
-                      }
-                      if (kind === 'ndkt' && it.fromPortal) {
-                        badges.push('<span class="eh-tc-tag">Đồng bộ Thuế</span>');
-                      }
-                      return `
-                        <div class="eh-tc-item" data-code="${esc(it.code)}">
-                          <div class="eh-tc-code">${esc(it.code)}</div>
-                          <div class="eh-tc-name">${esc(it.name)}${badges.join('')}</div>
-                        </div>
-                      `;
-                    })
-                    .join('')
-            }
-          </div>
-          <div class="eh-tc-foot">
-            <span>${
-              kind === 'ndkt'
-                ? `Danh mục: ${catalog.ndktList.length} mã (${catalog.portalSyncedCount} đã đồng bộ từ Thuế)`
-                : `Danh mục: ${catalog.chapterList.length} Mã Chương phổ biến`
-            }</span>
-            ${
-              kind === 'ndkt' && row.tieuMucImg
-                ? '<button type="button" class="eh-btn eh-btn-sm" id="eh-tc-open-native">🔄 Mở tra cứu Thuế để đồng bộ</button>'
-                : ''
-            }
-          </div>
-        </div>
-      `;
-
-      const popEl = root.querySelector('#eh-tc-pop');
-      if (popEl) positionPop(popEl);
-
-      root.querySelector('#eh-tc-close')?.addEventListener('click', closePicker);
-      root.querySelector('#eh-tc-open-native')?.addEventListener('click', () => {
-        closePicker();
-        row.tieuMucImg?.click();
-      });
-
-      const searchEl = root.querySelector('#eh-tc-search');
-      if (searchEl) {
-        searchEl.focus();
-        searchEl.setSelectionRange(searchQuery.length, searchQuery.length);
-        searchEl.addEventListener('input', (e) => {
-          searchQuery = e.target.value;
-          render();
-        });
-        searchEl.addEventListener('keydown', (e) => {
-          if (e.key === 'Escape') closePicker();
-        });
-      }
-
-      root.querySelectorAll('.eh-tc-item').forEach((el) => {
+      listEl.querySelectorAll('.eh-tc-item').forEach((el) => {
         el.addEventListener('click', () => {
           const pickedCode = el.dataset.code;
           const picked =
@@ -7565,7 +7644,61 @@ function createTaxCodeHelperFeature() {
       });
     };
 
-    render();
+    root.querySelector('#eh-tc-close')?.addEventListener('click', closePicker);
+    root.querySelector('#eh-tc-open-native')?.addEventListener('click', () => {
+      closePicker();
+      row.tieuMucImg?.click();
+    });
+
+    clearBtn?.addEventListener('click', () => {
+      searchQuery = '';
+      if (searchEl) {
+        searchEl.value = '';
+        searchEl.focus();
+      }
+      renderList();
+    });
+
+    if (searchEl) {
+      searchEl.addEventListener('input', (e) => {
+        searchQuery = e.target.value;
+        renderList();
+      });
+      searchEl.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') {
+          closePicker();
+          return;
+        }
+        // Lớp bảo vệ 3: Nếu trang `thuedientu` gắn chặn Backspace/Delete ở pha capture từ window/document
+        // khiến `e.defaultPrevented` đã bị bật sẵn trước khi tới `<input>`, tự thực hiện xóa an toàn!
+        if ((e.key === 'Backspace' || e.key === 'Delete') && e.defaultPrevented) {
+          const val = searchEl.value;
+          const start = searchEl.selectionStart ?? val.length;
+          const end = searchEl.selectionEnd ?? val.length;
+          let nextVal = val;
+          let nextPos = start;
+          if (start !== end) {
+            nextVal = val.slice(0, start) + val.slice(end);
+            nextPos = start;
+          } else if (e.key === 'Backspace' && start > 0) {
+            nextVal = val.slice(0, start - 1) + val.slice(end);
+            nextPos = start - 1;
+          } else if (e.key === 'Delete' && start < val.length) {
+            nextVal = val.slice(0, start) + val.slice(end + 1);
+            nextPos = start;
+          }
+          if (nextVal !== val) {
+            searchEl.value = nextVal;
+            searchEl.setSelectionRange(nextPos, nextPos);
+            searchQuery = nextVal;
+            renderList();
+          }
+        }
+      });
+      searchEl.focus();
+    }
+
+    renderList();
   };
 
   const attachRowHelper = (row) => {
@@ -8585,173 +8718,24 @@ function createQuickAccessFeature() {
   const renderPalettePopover = (popEl) => {
     injectDockStyle('quick-access-css', QA_DOCK_CSS);
 
-    const mst = getCurrentMst();
-    const { mstBookmarks, globalBookmarks } = getBookmarksForMst(mst);
-    const menuItems = scanPortalMenuItems(document);
-    const q = normalizeVietnamese(searchQuery);
-
-    const filterBm = (list) =>
-      q
-        ? list.filter(
-            (b) =>
-              normalizeVietnamese(b.coreCode).includes(q) ||
-              normalizeVietnamese(b.label).includes(q) ||
-              normalizeVietnamese(b.preferredOptionText).includes(q),
-          )
-        : list;
-
-    const filteredMstBm = filterBm(mstBookmarks);
-    const filteredGlobalBm = filterBm(globalBookmarks);
-    const filteredMenus = q
-      ? menuItems.filter(
-          (m) =>
-            normalizeVietnamese(m.label).includes(q) ||
-            normalizeVietnamese(m.group).includes(q),
-        )
-      : menuItems;
-
-    const totalBookmarks = mstBookmarks.length + globalBookmarks.length;
-    if (focusedIndex >= filteredMenus.length) focusedIndex = 0;
-
-    const renderBmChip = (b, scope) => `
-      <span class="eh-qa-bm ${scope === 'mst' ? 'mst-scope' : ''}" data-bm-id="${esc(b.id)}" data-bm-scope="${scope}"
-        title="Bấm để mở ngay Tờ khai mới cho ${esc(b.coreCode)}${b.preferredOptionText ? `\n(${esc(b.preferredOptionText)})` : ''}">
-        <span class="eh-qa-bm-run">${scope === 'mst' ? '🏢' : '★'} ${esc(b.coreCode)}${
-          b.label && b.label !== b.coreCode ? ` <span style="font-weight:400; opacity:0.85;">· ${esc(b.label.replace(new RegExp(`^${b.coreCode}\\s*[-—–:]?\\s*`, 'i'), '').slice(0, 26))}</span>` : ''
-        }</span>
-        <button type="button" class="eh-qa-bm-del" data-del-id="${esc(b.id)}" data-del-scope="${scope}" title="Bỏ ghim">×</button>
-      </span>
-    `;
-
+    // Dựng khung ngoài + ô tìm kiếm `#eh-qa-search` DUY NHẤT 1 LẦN để không làm nhảy con trỏ / mất dấu tiếng Việt khi gõ/xóa!
     popEl.innerHTML = `
       <div class="eh-pop-head">
         <div class="eh-pop-title">⚡ Truy cập nhanh &amp; Tờ khai đã ghim <span class="eh-muted" style="font-weight:500;">(Ctrl + K)</span></div>
         <button type="button" class="eh-pop-close" id="eh-qa-close" title="Đóng">×</button>
       </div>
-      <input type="text" class="eh-input" id="eh-qa-search" value="${esc(searchQuery)}"
-        placeholder="🔍 Gõ tên chức năng (Lập GNT, Tra cứu...) hoặc mã tờ khai (01/GTGT)..." autocomplete="off"/>
-
-      <div class="eh-qa-sec-title">
-        <span>★ Tờ khai đã ghim (1 chạm → tự mở Tờ khai mới)</span>
-        <button type="button" class="eh-btn eh-btn-sm" id="eh-qa-toggle-add">${showQuickAddForm ? 'Ẩn' : '+ Ghim mã'}</button>
+      <div style="display:flex; align-items:center; gap:6px;">
+        <input type="text" class="eh-input" id="eh-qa-search" value="${esc(searchQuery)}"
+          placeholder="🔍 Gõ tên chức năng (Lập GNT, Tra cứu...) hoặc mã tờ khai (01/GTGT)..." autocomplete="off" style="flex:1;"/>
+        <button type="button" class="eh-btn eh-btn-sm" id="eh-qa-clear" title="Xóa nhanh ô tìm kiếm" style="display:${searchQuery ? 'inline-flex' : 'none'};">✕</button>
       </div>
-
-      ${
-        showQuickAddForm
-          ? `
-        <div style="padding:8px; margin-bottom:8px; border:1px solid #bae0ff; border-radius:8px; background:#f8fafc;">
-          <div style="display:flex; gap:6px; margin-bottom:6px;">
-            <input type="text" class="eh-input" id="eh-qa-add-code" placeholder="Mã lõi (VD: 01/GTGT, 05/KK-TNCN)..." style="flex:1;"/>
-            <select class="eh-select" id="eh-qa-add-scope" style="width:140px;">
-              <option value="global">Ghim chung</option>
-              ${mst ? `<option value="mst">Riêng MST ${esc(mst)}</option>` : ''}
-            </select>
-          </div>
-          <div style="display:flex; gap:6px;">
-            <input type="text" class="eh-input" id="eh-qa-add-label" placeholder="Tên gợi nhớ ngắn (không bắt buộc)..." style="flex:1;"/>
-            <button type="button" class="eh-btn eh-btn-primary eh-btn-sm" id="eh-qa-add-save">Ghim</button>
-          </div>
-        </div>
-      `
-          : ''
-      }
-
-      ${
-        totalBookmarks === 0
-          ? `
-        <div style="padding:10px; border:1px dashed #cbd5e1; border-radius:8px; text-align:center; background:#f8fafc;">
-          <div class="eh-muted" style="margin-bottom:6px;">Chưa ghim tờ khai nào. Bạn có thể bấm nút <strong>☆ Ghim</strong> ngay trên trang <em>Thủ tục hành chính</em> hoặc nạp nhanh 5 mẫu DN phổ biến:</div>
-          <button type="button" class="eh-btn eh-btn-primary eh-btn-sm" id="eh-qa-seed">✨ Nạp nhanh 5 tờ khai DN phổ biến</button>
-        </div>
-      `
-          : `
-        ${
-          filteredMstBm.length > 0
-            ? `<div style="margin-bottom:6px;">
-                <div class="eh-muted" style="font-size:11px; margin-bottom:4px;">Ghim riêng cho MST ${esc(mst)}:</div>
-                <div class="eh-qa-chips">${filteredMstBm.map((b) => renderBmChip(b, 'mst')).join('')}</div>
-              </div>`
-            : ''
-        }
-        ${
-          filteredGlobalBm.length > 0
-            ? `<div class="eh-qa-chips">${filteredGlobalBm.map((b) => renderBmChip(b, 'global')).join('')}</div>`
-            : filteredMstBm.length === 0
-              ? '<div class="eh-muted" style="font-size:12px;">Không có tờ khai đã ghim nào khớp từ khóa.</div>'
-              : ''
-        }
-      `
-      }
-
-      ${statusBanner ? `<div class="eh-success" style="margin-top:7px;">${esc(statusBanner)}</div>` : ''}
-
-      <div class="eh-qa-sec-title">
-        <span>🧭 Chức năng cổng Thuế (quét động Menu)</span>
-        <span>${filteredMenus.length} mục</span>
-      </div>
-      <div class="eh-qa-menu-list">
-        ${
-          filteredMenus.length === 0
-            ? '<div style="padding:10px; text-align:center;" class="eh-muted">Không có mục menu nào khớp.</div>'
-            : filteredMenus
-                .map(
-                  (m, i) => `
-              <div class="eh-qa-menu-row ${i === focusedIndex ? 'focused' : ''}" data-menu-idx="${i}">
-                <span>${esc(m.label)}</span>
-                <span class="eh-qa-group">${esc(m.group)}</span>
-              </div>`,
-                )
-                .join('')
-        }
-      </div>
+      <div id="eh-qa-body"></div>
     `;
 
-    popEl.querySelector('#eh-qa-close')?.addEventListener('click', () => closeDockPopover('quickAccess'));
-
-    popEl.querySelector('#eh-qa-toggle-add')?.addEventListener('click', () => {
-      showQuickAddForm = !showQuickAddForm;
-      statusBanner = null;
-      renderPalettePopover(popEl);
-      if (showQuickAddForm) popEl.querySelector('#eh-qa-add-code')?.focus();
-    });
-
-    popEl.querySelector('#eh-qa-add-save')?.addEventListener('click', () => {
-      const code = (popEl.querySelector('#eh-qa-add-code')?.value || '').trim();
-      const label = (popEl.querySelector('#eh-qa-add-label')?.value || '').trim();
-      const scope = popEl.querySelector('#eh-qa-add-scope')?.value || 'global';
-      if (!code) return;
-      addBookmark({ coreCode: code, label: label || code, matchMode: 'core', scope, mst });
-      showQuickAddForm = false;
-      statusBanner = `Đã ghim tờ khai "${code}"!`;
-      renderPalettePopover(popEl);
-    });
-
-    popEl.querySelector('#eh-qa-seed')?.addEventListener('click', () => {
-      seedStarterBookmarks();
-      statusBanner = 'Đã nạp 5 tờ khai DN phổ biến!';
-      renderPalettePopover(popEl);
-    });
-
-    // Chạy tờ khai đã ghim hoặc xóa ghim
-    popEl.querySelectorAll('.eh-qa-bm').forEach((chip) => {
-      chip.addEventListener('click', (e) => {
-        if (e.target.closest('.eh-qa-bm-del')) return;
-        const id = chip.dataset.bmId;
-        const scope = chip.dataset.bmScope;
-        const list = scope === 'mst' ? mstBookmarks : globalBookmarks;
-        const target = list.find((b) => b.id === id);
-        if (target) launchBookmark(target);
-      });
-    });
-
-    popEl.querySelectorAll('.eh-qa-bm-del').forEach((btn) => {
-      btn.addEventListener('click', (e) => {
-        e.stopPropagation();
-        removeBookmark({ id: btn.dataset.delId, scope: btn.dataset.delScope, mst });
-        statusBanner = null;
-        renderPalettePopover(popEl);
-      });
-    });
+    const bodyEl = popEl.querySelector('#eh-qa-body');
+    const searchInput = popEl.querySelector('#eh-qa-search');
+    const clearBtn = popEl.querySelector('#eh-qa-clear');
+    let latestFilteredMenus = [];
 
     const activateMenu = (item) => {
       if (!item) return;
@@ -8763,37 +8747,215 @@ function createQuickAccessFeature() {
       }
     };
 
-    popEl.querySelectorAll('.eh-qa-menu-row').forEach((row) => {
-      row.addEventListener('click', () => {
-        activateMenu(filteredMenus[Number(row.dataset.menuIdx)]);
+    const renderBody = () => {
+      if (!bodyEl) return;
+      if (clearBtn) clearBtn.style.display = searchQuery ? 'inline-flex' : 'none';
+
+      const mst = getCurrentMst();
+      const { mstBookmarks, globalBookmarks } = getBookmarksForMst(mst);
+      const menuItems = scanPortalMenuItems(document);
+      const q = normalizeVietnamese(searchQuery);
+
+      const filterBm = (list) =>
+        q
+          ? list.filter(
+              (b) =>
+                normalizeVietnamese(b.coreCode).includes(q) ||
+                normalizeVietnamese(b.label).includes(q) ||
+                normalizeVietnamese(b.preferredOptionText).includes(q),
+            )
+          : list;
+
+      const filteredMstBm = filterBm(mstBookmarks);
+      const filteredGlobalBm = filterBm(globalBookmarks);
+      const filteredMenus = q
+        ? menuItems.filter(
+            (m) =>
+              normalizeVietnamese(m.label).includes(q) ||
+              normalizeVietnamese(m.group).includes(q),
+          )
+        : menuItems;
+
+      latestFilteredMenus = filteredMenus;
+      const totalBookmarks = mstBookmarks.length + globalBookmarks.length;
+      if (focusedIndex >= filteredMenus.length) focusedIndex = 0;
+
+      const renderBmChip = (b, scope) => `
+        <span class="eh-qa-bm ${scope === 'mst' ? 'mst-scope' : ''}" data-bm-id="${esc(b.id)}" data-bm-scope="${scope}"
+          title="Bấm để mở ngay Tờ khai mới cho ${esc(b.coreCode)}${b.preferredOptionText ? `\n(${esc(b.preferredOptionText)})` : ''}">
+          <span class="eh-qa-bm-run">${scope === 'mst' ? '🏢' : '★'} ${esc(b.coreCode)}${
+            b.label && b.label !== b.coreCode ? ` <span style="font-weight:400; opacity:0.85;">· ${esc(b.label.replace(new RegExp(`^${b.coreCode}\\s*[-—–:]?\\s*`, 'i'), '').slice(0, 26))}</span>` : ''
+          }</span>
+          <button type="button" class="eh-qa-bm-del" data-del-id="${esc(b.id)}" data-del-scope="${scope}" title="Bỏ ghim">×</button>
+        </span>
+      `;
+
+      bodyEl.innerHTML = `
+        <div class="eh-qa-sec-title">
+          <span>★ Tờ khai đã ghim (1 chạm → tự mở Tờ khai mới)</span>
+          <button type="button" class="eh-btn eh-btn-sm" id="eh-qa-toggle-add">${showQuickAddForm ? 'Ẩn' : '+ Ghim mã'}</button>
+        </div>
+
+        ${
+          showQuickAddForm
+            ? `
+          <div style="padding:8px; margin-bottom:8px; border:1px solid #bae0ff; border-radius:8px; background:#f8fafc;">
+            <div style="display:flex; gap:6px; margin-bottom:6px;">
+              <input type="text" class="eh-input" id="eh-qa-add-code" placeholder="Mã lõi (VD: 01/GTGT, 05/KK-TNCN)..." style="flex:1;"/>
+              <select class="eh-select" id="eh-qa-add-scope" style="width:140px;">
+                <option value="global">Ghim chung</option>
+                ${mst ? `<option value="mst">Riêng MST ${esc(mst)}</option>` : ''}
+              </select>
+            </div>
+            <div style="display:flex; gap:6px;">
+              <input type="text" class="eh-input" id="eh-qa-add-label" placeholder="Tên gợi nhớ ngắn (không bắt buộc)..." style="flex:1;"/>
+              <button type="button" class="eh-btn eh-btn-primary eh-btn-sm" id="eh-qa-add-save">Ghim</button>
+            </div>
+          </div>
+        `
+            : ''
+        }
+
+        ${
+          totalBookmarks === 0
+            ? `
+          <div style="padding:10px; border:1px dashed #cbd5e1; border-radius:8px; text-align:center; background:#f8fafc;">
+            <div class="eh-muted" style="margin-bottom:6px;">Chưa ghim tờ khai nào. Bạn có thể bấm nút <strong>☆ Ghim</strong> ngay trên trang <em>Thủ tục hành chính</em> hoặc nạp nhanh 5 mẫu DN phổ biến:</div>
+            <button type="button" class="eh-btn eh-btn-primary eh-btn-sm" id="eh-qa-seed">✨ Nạp nhanh 5 tờ khai DN phổ biến</button>
+          </div>
+        `
+            : `
+          ${
+            filteredMstBm.length > 0
+              ? `<div style="margin-bottom:6px;">
+                  <div class="eh-muted" style="font-size:11px; margin-bottom:4px;">Ghim riêng cho MST ${esc(mst)}:</div>
+                  <div class="eh-qa-chips">${filteredMstBm.map((b) => renderBmChip(b, 'mst')).join('')}</div>
+                </div>`
+              : ''
+          }
+          ${
+            filteredGlobalBm.length > 0
+              ? `<div class="eh-qa-chips">${filteredGlobalBm.map((b) => renderBmChip(b, 'global')).join('')}</div>`
+              : filteredMstBm.length === 0
+                ? '<div class="eh-muted" style="font-size:12px;">Không có tờ khai đã ghim nào khớp từ khóa.</div>'
+                : ''
+          }
+        `
+        }
+
+        ${statusBanner ? `<div class="eh-success" style="margin-top:7px;">${esc(statusBanner)}</div>` : ''}
+
+        <div class="eh-qa-sec-title">
+          <span>🧭 Chức năng cổng Thuế (quét động Menu)</span>
+          <span>${filteredMenus.length} mục</span>
+        </div>
+        <div class="eh-qa-menu-list">
+          ${
+            filteredMenus.length === 0
+              ? '<div style="padding:10px; text-align:center;" class="eh-muted">Không có mục menu nào khớp.</div>'
+              : filteredMenus
+                  .map(
+                    (m, i) => `
+                <div class="eh-qa-menu-row ${i === focusedIndex ? 'focused' : ''}" data-menu-idx="${i}">
+                  <span>${esc(m.label)}</span>
+                  <span class="eh-qa-group">${esc(m.group)}</span>
+                </div>`,
+                  )
+                  .join('')
+          }
+        </div>
+      `;
+
+      bodyEl.querySelector('#eh-qa-toggle-add')?.addEventListener('click', () => {
+        showQuickAddForm = !showQuickAddForm;
+        statusBanner = null;
+        renderBody();
+        if (showQuickAddForm) bodyEl.querySelector('#eh-qa-add-code')?.focus();
       });
+
+      bodyEl.querySelector('#eh-qa-add-save')?.addEventListener('click', () => {
+        const code = (bodyEl.querySelector('#eh-qa-add-code')?.value || '').trim();
+        const label = (bodyEl.querySelector('#eh-qa-add-label')?.value || '').trim();
+        const scope = bodyEl.querySelector('#eh-qa-add-scope')?.value || 'global';
+        if (!code) return;
+        addBookmark({ coreCode: code, label: label || code, matchMode: 'core', scope, mst });
+        showQuickAddForm = false;
+        statusBanner = `Đã ghim tờ khai "${code}"!`;
+        renderBody();
+      });
+
+      bodyEl.querySelector('#eh-qa-seed')?.addEventListener('click', () => {
+        seedStarterBookmarks();
+        statusBanner = 'Đã nạp 5 tờ khai DN phổ biến!';
+        renderBody();
+      });
+
+      bodyEl.querySelectorAll('.eh-qa-bm').forEach((chip) => {
+        chip.addEventListener('click', (e) => {
+          if (e.target.closest('.eh-qa-bm-del')) return;
+          const id = chip.dataset.bmId;
+          const scope = chip.dataset.bmScope;
+          const list = scope === 'mst' ? mstBookmarks : globalBookmarks;
+          const target = list.find((b) => b.id === id);
+          if (target) launchBookmark(target);
+        });
+      });
+
+      bodyEl.querySelectorAll('.eh-qa-bm-del').forEach((btn) => {
+        btn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          removeBookmark({ id: btn.dataset.delId, scope: btn.dataset.delScope, mst });
+          statusBanner = null;
+          renderBody();
+        });
+      });
+
+      bodyEl.querySelectorAll('.eh-qa-menu-row').forEach((row) => {
+        row.addEventListener('click', () => {
+          activateMenu(latestFilteredMenus[Number(row.dataset.menuIdx)]);
+        });
+      });
+    };
+
+    popEl.querySelector('#eh-qa-close')?.addEventListener('click', () => closeDockPopover('quickAccess'));
+
+    clearBtn?.addEventListener('click', () => {
+      searchQuery = '';
+      focusedIndex = 0;
+      if (searchInput) {
+        searchInput.value = '';
+        searchInput.focus();
+      }
+      renderBody();
     });
 
-    const searchInput = popEl.querySelector('#eh-qa-search');
-    if (searchInput && !showQuickAddForm) {
-      searchInput.focus();
-      searchInput.setSelectionRange(searchQuery.length, searchQuery.length);
+    if (searchInput) {
       searchInput.addEventListener('input', (e) => {
         searchQuery = e.target.value;
         focusedIndex = 0;
         statusBanner = null;
-        renderPalettePopover(popEl);
+        renderBody();
       });
       searchInput.addEventListener('keydown', (e) => {
-        if (e.key === 'ArrowDown' && filteredMenus.length > 0) {
+        if (e.key === 'ArrowDown' && latestFilteredMenus.length > 0) {
           e.preventDefault();
-          focusedIndex = (focusedIndex + 1) % filteredMenus.length;
-          renderPalettePopover(popEl);
-        } else if (e.key === 'ArrowUp' && filteredMenus.length > 0) {
+          focusedIndex = (focusedIndex + 1) % latestFilteredMenus.length;
+          renderBody();
+        } else if (e.key === 'ArrowUp' && latestFilteredMenus.length > 0) {
           e.preventDefault();
-          focusedIndex = (focusedIndex - 1 + filteredMenus.length) % filteredMenus.length;
-          renderPalettePopover(popEl);
-        } else if (e.key === 'Enter' && filteredMenus.length > 0) {
+          focusedIndex = (focusedIndex - 1 + latestFilteredMenus.length) % latestFilteredMenus.length;
+          renderBody();
+        } else if (e.key === 'Enter' && latestFilteredMenus.length > 0) {
           e.preventDefault();
-          activateMenu(filteredMenus[focusedIndex]);
+          activateMenu(latestFilteredMenus[focusedIndex]);
         }
       });
+      if (!showQuickAddForm) {
+        searchInput.focus();
+      }
     }
+
+    renderBody();
   };
 
   const openPalette = () => {
