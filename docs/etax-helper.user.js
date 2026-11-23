@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         eTax Helper Internal
 // @namespace    https://etax-helper.internal/userscript
-// @version      1.0.0
-// @description  Hỗ trợ thao tác nội bộ trên Cổng Dịch vụ công Thuế & eTax (Chọn nhanh MST mã hóa PIN, Chọn ngày 2 cấp, Mở rộng bảng, Đồng hồ giữ phiên)
+// @version      2.0.0
+// @description  Hỗ trợ nghiệp vụ kế toán nội bộ trên Cổng Dịch vụ công Thuế & eTax (MST mã hóa PIN, Chọn ngày 2 cấp, Mở rộng bảng, Đồng hồ giữ phiên, Unified Dock định danh & Ghi chú, Trợ lý MC/TM & đối soát Xanh/Đỏ, Truy cập nhanh & Ghim tờ khai, Trạng thái CT SigningHub & eSigner)
 // @author       Internal Accounting Tech Team
 // @match        https://dichvucong.gdt.gov.vn/*
 // @match        https://thuedientu.gdt.gov.vn/*
@@ -15,8 +15,10 @@
 // @grant        GM_registerMenuCommand
 // @grant        GM_unregisterMenuCommand
 // @grant        GM_addStyle
+// @grant        GM_xmlhttpRequest
 // @grant        unsafeWindow
-// @connect      none
+// @connect      localhost
+// @connect      127.0.0.1
 // @updateURL    https://gibbs1111.github.io/etax-helper/etax-helper.meta.js
 // @downloadURL  https://gibbs1111.github.io/etax-helper/etax-helper.user.js
 // ==/UserScript==
@@ -36,6 +38,14 @@ const STORAGE_KEYS = {
   VAULT_BACKUP_PREV: 'etax_vault_backup_prev',
   TIMER_CONFIG: 'etax_timer_config_v1',
   LAST_ACTIVITY: 'etax_last_activity_v1',
+  // v2 keys (hoàn toàn không ảnh hưởng dữ liệu v1)
+  DOCK_UI_STATE: 'etax_dock_ui_v2',
+  EXTRA_NOTES: 'etax_extra_notes_v1',
+  TAX_CODES_CACHE: 'etax_tax_codes_v1',
+  BOOKMARKS: 'etax_bookmarks_v1',
+  SIGNING_CONFIG: 'etax_signing_config_v1',
+  ACTIVE_COMPANY_CTX: 'etax_active_company_v2',
+  OPEN_QUICK_ACCESS_EVT: 'etax_open_quick_access_evt_v2',
 };
 
 const memoryFallback = new Map();
@@ -118,12 +128,16 @@ function removeValueChangeListener(id) {
 const { STORAGE_KEYS, getValue, setValue, addValueChangeListener } = __require("core/storage.js");
 
 const DEFAULT_SETTINGS = {
-  schemaVersion: 1,
+  schemaVersion: 2,
   features: {
     quickLogin: true,
     datePresets: true,
     tableEnhancer: true,
     sessionTimer: true,
+    companyBar: true,
+    taxCodeHelper: true,
+    quickAccess: true,
+    signingStatus: true,
   },
 };
 
@@ -132,6 +146,10 @@ const FEATURE_MENU_ITEMS = [
   { key: 'datePresets', label: '2. Chọn nhanh khoảng thời gian' },
   { key: 'tableEnhancer', label: '3. Mở rộng bảng & Cố định tiêu đề' },
   { key: 'sessionTimer', label: '4. Đồng hồ phiên làm việc' },
+  { key: 'companyBar', label: '5. Thanh định danh Cty & Ghi chú' },
+  { key: 'taxCodeHelper', label: '6. Trợ lý Mã Chương / Tiểu mục & Đối soát' },
+  { key: 'quickAccess', label: '7. Truy cập nhanh & Ghim tờ khai' },
+  { key: 'signingStatus', label: '8. Trạng thái Ký số (SigningHub & eSigner)' },
 ];
 
 let registeredMenuIds = [];
@@ -142,7 +160,7 @@ function getSettings() {
     return structuredClone(DEFAULT_SETTINGS);
   }
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     features: {
       ...DEFAULT_SETTINGS.features,
       ...(saved.features || {}),
@@ -152,7 +170,7 @@ function getSettings() {
 
 function saveSettings(nextSettings) {
   const normalized = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     features: {
       ...DEFAULT_SETTINGS.features,
       ...(nextSettings.features || {}),
@@ -177,7 +195,7 @@ function onSettingsChange(callback) {
     callback(
       newVal && typeof newVal === 'object'
         ? {
-            schemaVersion: 1,
+            schemaVersion: 2,
             features: { ...DEFAULT_SETTINGS.features, ...(newVal.features || {}) },
           }
         : structuredClone(DEFAULT_SETTINGS),
@@ -245,7 +263,12 @@ const ETAX_ORIGIN = 'https://thuedientu.gdt.gov.vn';
 const ALLOWED_ORIGINS = new Set([DVC_ORIGIN, ETAX_ORIGIN]);
 
 const KEEP_ALIVE_URL = `${DVC_ORIGIN}/tthc/home`;
+const TTHC_DECLARATION_URL = `${DVC_ORIGIN}/tthc/thu-tuc-hanh-chinh`;
 const DATE_FORMAT = 'DD/MM/YYYY';
+const DEFAULT_SIGNING_PORTS = {
+  signingHub: 32001,
+  eSigner: 8768,
+};
 
 const STATIC_ASSET_RE = /\.(?:css|js|mjs|png|jpe?g|gif|svg|ico|webp|woff2?|ttf|eot|map|bmp)(?:\?|#|$)/i;
 const IGNORED_PATH_PATTERNS = [
@@ -474,6 +497,321 @@ function isKeepAliveResponseAlive(status, finalUrl, bodyText) {
   return text.includes('dangXuat(') || text.includes('user-name');
 }
 
+// ============================================================================
+// V2 ADAPTERS — ĐÃ XÁC MINH 100% QUA F12 NHÓM A, B, C, D
+// ============================================================================
+
+/**
+ * Hàm thuần phân tích tên công ty, MST tổ chức và Số định danh (CCCD) từ header `dichvucong.gdt.gov.vn` (Nhóm A).
+ * QUAN TRỌNG: Phải khớp đúng nhãn "MST tổ chức" để KHÔNG bắt nhầm "Số định danh" (CCCD 12 số) đứng ngay phía trên!
+ */
+function parseUserHeaderInfo({ companyNameText = '', dropdownTexts = [] } = {}) {
+  const companyName = String(companyNameText || '').replace(/\s+/g, ' ').trim();
+  let orgMst = '';
+  let personalId = '';
+
+  for (const raw of dropdownTexts) {
+    const text = String(raw || '').replace(/\s+/g, ' ').trim();
+    if (!text) continue;
+    const norm = normalizeVietnamese(text);
+
+    if (norm.includes('mst') || norm.includes('ma so thue')) {
+      const m = text.match(/(\d{10}(?:-\d{3})?)/);
+      if (m) {
+        orgMst = m[1];
+        continue;
+      }
+    }
+    if (norm.includes('so dinh danh') || norm.includes('cccd') || norm.includes('cmnd')) {
+      const m = text.match(/(\d{9,14})/);
+      if (m) {
+        personalId = m[1];
+      }
+    }
+  }
+
+  return {
+    mst: orgMst || personalId || '',
+    orgMst,
+    personalId,
+    isOrganization: Boolean(orgMst),
+    companyName,
+  };
+}
+
+/**
+ * Trích xuất thông tin doanh nghiệp đang đăng nhập từ DOM của `dichvucong.gdt.gov.vn` (F12 Nhóm A).
+ */
+function extractLoggedInCompany(doc = document) {
+  const header = doc.querySelector('.user-header') || doc;
+  const tenDnEl = header.querySelector('span.ten_dn');
+  let companyNameText = tenDnEl ? tenDnEl.textContent : '';
+
+  if (!companyNameText || !companyNameText.trim()) {
+    const userSpan = header.querySelector(':scope > span.user-name, span.user-name');
+    if (userSpan) {
+      companyNameText = userSpan.textContent || '';
+    }
+  }
+
+  const dropdownItems = Array.from(
+    header.querySelectorAll('.dropdown-menu .user-name.dropdown-item, .dropdown-menu .user-name'),
+  ).map((el) => el.textContent || '');
+
+  return parseUserHeaderInfo({ companyNameText, dropdownTexts: dropdownItems });
+}
+
+/**
+ * Nhận diện màn hình Lập Giấy nộp tiền trong iframe `thuedientu.gdt.gov.vn` (F12 Nhóm B).
+ */
+function isGntFormPage(doc = document) {
+  return Boolean(doc.querySelector('table#taxDetail'));
+}
+
+/**
+ * Lấy danh sách các dòng khoản nộp trong bảng `#taxDetail` (hỗ trợ nhiều dòng _1, _2... khi bấm "Thêm dòng").
+ */
+function findGntDetailRows(doc = document) {
+  const table = doc.querySelector('table#taxDetail');
+  if (!table) return [];
+
+  const rows = [];
+  const trs = table.querySelectorAll('tr');
+  for (const tr of trs) {
+    const maTieuMucInput = tr.querySelector('input[name="ma_tieumuc"], input[id^="ma_tieumuc_"]');
+    const maChuongInput = tr.querySelector('input[name="ma_chuong"], input[id^="ma_chuong_"]');
+    if (!maTieuMucInput && !maChuongInput) continue;
+
+    const idSource = (maTieuMucInput && maTieuMucInput.id) || (maChuongInput && maChuongInput.id) || '';
+    const idxMatch = idSource.match(/_(\d+)$/);
+    const index = idxMatch ? idxMatch[1] : String(rows.length + 1);
+
+    rows.push({
+      index,
+      tr,
+      loaiGdSelect: tr.querySelector(`#loai_gd_${index}, select[name="loai_gd"]`),
+      maTkhaiSelect: tr.querySelector(`#ma_tkhai_${index}, select[name="ma_tkhai"]`),
+      noiDungInput: tr.querySelector(`#noi_dung_${index}, input[name="noi_dung"]`),
+      tieuMucImg: tr.querySelector(`#img_ma_tieumuc_${index}, img[onclick*="openWindow("]`),
+      ghiChuInput: tr.querySelector(`#ghichu_${index}, input[name="ghi_chu"]`),
+      soTienInput: tr.querySelector(`#so_tien_${index}, input[name="so_tien"]`),
+      soNguyenTeInput: tr.querySelector(`#so_nguyen_te_${index}, input[name="so_nguyen_te"]`),
+      maTieuMucInput,
+      maChuongInput,
+    });
+  }
+  return rows;
+}
+
+/**
+ * Nhận diện cửa sổ popup tra cứu Tiểu mục (Mã NDKT) của eTax (`dse_nextEventName=getNdkt`) (F12 Nhóm B).
+ */
+function isNdktPopupPage(loc = location, doc = document) {
+  if (loc.origin !== ETAX_ORIGIN) return false;
+  if (String(loc.search || '').includes('getNdkt')) return true;
+  return Boolean(doc.querySelector('select#cboNdkt') && doc.querySelector('table#tblResult'));
+}
+
+/**
+ * Tách chuỗi dạng `'1151- Lợi nhuận sau thuế...'` trong `chonDanhMuc(...)` hoặc bảng `#tblResult`.
+ */
+function parseNdktEntryText(rawText) {
+  const cleaned = String(rawText || '').replace(/\s+/g, ' ').trim();
+  const match = cleaned.match(/^(\d{4})\s*-\s*(.+)$/);
+  if (!match) return null;
+  return {
+    code: match[1].trim(),
+    name: match[2].trim(),
+  };
+}
+
+/**
+ * Đọc danh sách Mã NDKT từ bảng `#tblResult` trong popup `getNdkt` (F12 Nhóm B).
+ */
+function parseNdktResultTable(doc = document, groupCode = '') {
+  const table = doc.querySelector('table#tblResult');
+  if (!table) return [];
+
+  const entries = [];
+  const seen = new Set();
+  const trs = table.querySelectorAll('tr');
+
+  for (const tr of trs) {
+    const link = tr.querySelector('a[href*="chonDanhMuc"]');
+    let parsed = null;
+
+    if (link) {
+      const href = link.getAttribute('href') || '';
+      const argMatch = href.match(/chonDanhMuc\(\s*['"]([^'"]+)['"]\s*\)/);
+      if (argMatch) {
+        parsed = parseNdktEntryText(argMatch[1]);
+      }
+    }
+
+    if (!parsed) {
+      const tds = tr.querySelectorAll('td');
+      if (tds.length >= 3) {
+        const colCode = (tds[1].textContent || '').trim();
+        const colName = (tds[2].textContent || '').trim();
+        parsed = parseNdktEntryText(colName);
+        if (!parsed && /^\d{4}$/.test(colCode) && colName) {
+          parsed = { code: colCode, name: colName.replace(/\s+/g, ' ').trim() };
+        }
+      }
+    }
+
+    if (parsed && !seen.has(parsed.code)) {
+      seen.add(parsed.code);
+      entries.push({
+        code: parsed.code,
+        name: parsed.name,
+        group: groupCode || '',
+      });
+    }
+  }
+  return entries;
+}
+
+/**
+ * Quét động cây Menu thực tế sau khi đăng nhập trên `dichvucong.gdt.gov.vn` (F12 Nhóm A & C).
+ * Không gắn cứng URL — tự động thích nghi khi Tổng cục Thuế thêm/đổi mục menu.
+ */
+function scanPortalMenuItems(doc = document) {
+  const items = [];
+  const seenKey = new Set();
+
+  const pushItem = ({ label, group, href, el }) => {
+    const cleanLabel = String(label || '').replace(/\s+/g, ' ').trim();
+    if (!cleanLabel) return;
+    const rawHref = String(href || '').trim();
+    if (!rawHref || rawHref === '#' || rawHref.startsWith('javascript:')) {
+      if (!el) return;
+    }
+    if (normalizeVietnamese(cleanLabel).includes('dang xuat')) return;
+
+    const dedup = `${rawHref}|${normalizeVietnamese(cleanLabel)}`;
+    if (seenKey.has(dedup)) return;
+    seenKey.add(dedup);
+    items.push({ label: cleanLabel, group: group || 'Menu chính', href: rawHref, el: el || null });
+  };
+
+  // 1. Thanh menu chính `#navbarNav`
+  const navItems = doc.querySelectorAll('#navbarNav ul.navbar-nav > li.nav-item');
+  for (const li of navItems) {
+    const parentLink = li.querySelector(':scope > a.nav-link');
+    const subLinks = li.querySelectorAll(':scope > ul.dropdown-menu a.dropdown-item');
+
+    const parentText = (parentLink?.textContent || '').replace(/\s+/g, ' ').trim();
+    const parentHref = (parentLink?.getAttribute('href') || '').trim();
+
+    if (subLinks.length > 0) {
+      for (const sub of subLinks) {
+        pushItem({
+          label: sub.textContent,
+          group: parentText || 'Menu chính',
+          href: sub.getAttribute('href'),
+          el: sub,
+        });
+      }
+    } else if (parentLink && parentHref) {
+      const label = parentText || (parentHref.includes('/home') ? 'Trang chủ' : '');
+      pushItem({
+        label,
+        group: 'Menu chính',
+        href: parentHref,
+        el: parentLink,
+      });
+    }
+  }
+
+  // 2. Các mục tiện ích trong menu người dùng `.user-header .dropdown-menu`
+  const userLinks = doc.querySelectorAll('.user-header .dropdown-menu a.dropdown-item[href]');
+  for (const a of userLinks) {
+    const href = (a.getAttribute('href') || '').trim();
+    if (!href || href === '#') continue;
+    pushItem({
+      label: a.textContent,
+      group: 'Tài khoản & Thông báo',
+      href,
+      el: a,
+    });
+  }
+
+  return items;
+}
+
+/**
+ * Nhận diện trang Tra cứu & Nộp Thủ tục hành chính (`/tthc/thu-tuc-hanh-chinh`) (F12 Nhóm C).
+ */
+function isTthcDeclarationPage(loc = location, doc = document) {
+  if (loc.origin !== DVC_ORIGIN) return false;
+  if (!loc.pathname.includes('/tthc/thu-tuc-hanh-chinh')) return false;
+  return Boolean(doc.querySelector('#form_search') || doc.querySelector('#btnTthcSearchHome'));
+}
+
+/**
+ * Tìm dropdown chọn Tờ khai (`bs-select-4` / bootstrap-select), thẻ `<select>` ẩn gốc,
+ * nút Tìm kiếm `#btnTthcSearchHome` và vùng kết quả `#bangKetQuaTTHC` (F12 Nhóm C).
+ */
+function findDeclarationSelectContext(doc = document) {
+  let toggleBtn = doc.querySelector('button[aria-owns="bs-select-4"]');
+  let wrapper = toggleBtn ? toggleBtn.closest('.bootstrap-select') : null;
+  let selectEl = wrapper ? wrapper.querySelector('select') : null;
+
+  // Dự phòng nếu bootstrap-select đổi số thứ tự bs-select-N
+  if (!selectEl) {
+    const selects = doc.querySelectorAll('#form_search select, .bootstrap-select select');
+    for (const sel of selects) {
+      if (sel.options && sel.options.length > 50) {
+        const sample = Array.from(sel.options)
+          .slice(0, 60)
+          .map((o) => o.textContent || '')
+          .join(' ');
+        if (sample.includes('01/GTGT') || sample.includes('05/KK-TNCN') || sample.includes('03/TNDN')) {
+          selectEl = sel;
+          wrapper = sel.closest('.bootstrap-select');
+          toggleBtn = wrapper ? wrapper.querySelector('button.dropdown-toggle') : null;
+          break;
+        }
+      }
+    }
+  }
+
+  if (!selectEl) return null;
+
+  return {
+    selectEl,
+    wrapper,
+    toggleBtn,
+    searchButton: doc.querySelector('#btnTthcSearchHome'),
+    resultContainer: doc.querySelector('#bangKetQuaTTHC'),
+  };
+}
+
+/**
+ * Lấy danh sách các nút "Nộp hồ sơ" (`a.nop-hoso-btn`) trong bảng kết quả `#bangKetQuaTTHC` (F12 Nhóm C).
+ */
+function findTthcProcedureButtons(doc = document) {
+  const container = doc.querySelector('#bangKetQuaTTHC') || doc;
+  const links = container.querySelectorAll('a.nop-hoso-btn');
+  return Array.from(links).map((el) => {
+    const maTthc = (el.getAttribute('ma-tthc') || '').trim();
+    const tenTthc = (el.getAttribute('ten-tthc') || '').trim();
+    const doiTuong = (el.getAttribute('doi-tuong') || '').trim();
+    const maToKhai = (el.getAttribute('ma-to-khai') || '').trim();
+    const normTen = normalizeVietnamese(tenTthc);
+    const isSupplementary = maTthc === '1.008327' || normTen.includes('khai bo sung');
+    return {
+      el,
+      maTthc,
+      tenTthc,
+      doiTuong,
+      maToKhai,
+      isSupplementary,
+    };
+  });
+}
+
   __exports.normalizeVietnamese = normalizeVietnamese;
   __exports.isDvcOrigin = isDvcOrigin;
   __exports.isEtaxOrigin = isEtaxOrigin;
@@ -484,18 +822,32 @@ function isKeepAliveResponseAlive(status, finalUrl, bodyText) {
   __exports.setNativeInputValue = setNativeInputValue;
   __exports.isRealTaxServerRequest = isRealTaxServerRequest;
   __exports.isKeepAliveResponseAlive = isKeepAliveResponseAlive;
+  __exports.parseUserHeaderInfo = parseUserHeaderInfo;
+  __exports.extractLoggedInCompany = extractLoggedInCompany;
+  __exports.isGntFormPage = isGntFormPage;
+  __exports.findGntDetailRows = findGntDetailRows;
+  __exports.isNdktPopupPage = isNdktPopupPage;
+  __exports.parseNdktEntryText = parseNdktEntryText;
+  __exports.parseNdktResultTable = parseNdktResultTable;
+  __exports.scanPortalMenuItems = scanPortalMenuItems;
+  __exports.isTthcDeclarationPage = isTthcDeclarationPage;
+  __exports.findDeclarationSelectContext = findDeclarationSelectContext;
+  __exports.findTthcProcedureButtons = findTthcProcedureButtons;
   __exports.DVC_ORIGIN = DVC_ORIGIN;
   __exports.ETAX_ORIGIN = ETAX_ORIGIN;
   __exports.ALLOWED_ORIGINS = ALLOWED_ORIGINS;
   __exports.KEEP_ALIVE_URL = KEEP_ALIVE_URL;
+  __exports.TTHC_DECLARATION_URL = TTHC_DECLARATION_URL;
   __exports.DATE_FORMAT = DATE_FORMAT;
+  __exports.DEFAULT_SIGNING_PORTS = DEFAULT_SIGNING_PORTS;
   },
 
   "core/frame-bus.js": function(__require, __exports) {
 const { ALLOWED_ORIGINS, DVC_ORIGIN } = __require("adapters/etax-adapter.js");
-const { STORAGE_KEYS, setValue, addValueChangeListener } = __require("core/storage.js");
+const { STORAGE_KEYS, setValue, addValueChangeListener, removeValueChangeListener } = __require("core/storage.js");
 
 const MSG_TYPE_ACTIVITY = 'ETAX_HELPER_SERVER_ACTIVITY';
+const MSG_TYPE_OPEN_QUICK_ACCESS = 'ETAX_HELPER_OPEN_QUICK_ACCESS';
 
 function isTopFrame() {
   try {
@@ -551,13 +903,69 @@ function subscribeServerActivity(handler) {
 
   return () => {
     window.removeEventListener('message', onMessage);
-    void gmId;
+    removeValueChangeListener(gmId);
+  };
+}
+
+/**
+ * Gửi lệnh mở khung Truy cập nhanh (Ctrl+K) từ iframe cross-origin lên Top-Frame.
+ */
+function notifyOpenQuickAccess(source = 'iframe-shortcut') {
+  const payload = {
+    type: MSG_TYPE_OPEN_QUICK_ACCESS,
+    source,
+    origin: location.origin,
+    timestamp: Date.now(),
+    nonce: Math.random().toString(36).slice(2, 8),
+  };
+
+  if (!isTopFrame()) {
+    try {
+      window.top.postMessage(payload, DVC_ORIGIN);
+    } catch {
+      // fallback GM_setValue bên dưới
+    }
+  }
+  setValue(STORAGE_KEYS.OPEN_QUICK_ACCESS_EVT, payload);
+}
+
+/**
+ * Lắng nghe yêu cầu mở khung Truy cập nhanh tại Top-Frame (từ iframe thuedientu).
+ */
+function subscribeOpenQuickAccess(handler) {
+  let lastNonce = '';
+  const dispatchOnce = (data) => {
+    if (!data || data.type !== MSG_TYPE_OPEN_QUICK_ACCESS) return;
+    if (data.nonce && data.nonce === lastNonce) return;
+    lastNonce = data.nonce || '';
+    handler(data);
+  };
+
+  const onMessage = (event) => {
+    if (!ALLOWED_ORIGINS.has(event.origin)) return;
+    dispatchOnce(event.data);
+  };
+
+  window.addEventListener('message', onMessage);
+
+  const gmId = addValueChangeListener(
+    STORAGE_KEYS.OPEN_QUICK_ACCESS_EVT,
+    (_k, _oldVal, newVal) => {
+      dispatchOnce(newVal);
+    },
+  );
+
+  return () => {
+    window.removeEventListener('message', onMessage);
+    removeValueChangeListener(gmId);
   };
 }
 
   __exports.isTopFrame = isTopFrame;
   __exports.notifyServerActivity = notifyServerActivity;
   __exports.subscribeServerActivity = subscribeServerActivity;
+  __exports.notifyOpenQuickAccess = notifyOpenQuickAccess;
+  __exports.subscribeOpenQuickAccess = subscribeOpenQuickAccess;
   },
 
   "security/crypto-vault.js": function(__require, __exports) {
@@ -755,6 +1163,9 @@ function initChannel() {
   if (channel || typeof BroadcastChannel !== 'function') return;
   try {
     channel = new BroadcastChannel(CHANNEL_NAME);
+    if (typeof channel.unref === 'function') {
+      channel.unref();
+    }
     channel.onmessage = async (event) => {
       const msg = event.data;
       if (!msg || !msg.type) return;
@@ -1278,7 +1689,9 @@ function triggerFileDownload(bytes, fileName, mimeType) {
   },
 
   "features/quick-login/company-store.js": function(__require, __exports) {
-const { STORAGE_KEYS, getValue, setValue, deleteValue } = __require("core/storage.js");
+const { STORAGE_KEYS, getValue, setValue, deleteValue, addValueChangeListener, removeValueChangeListener } = __require("core/storage.js");
+
+const LAST_LOGIN_ACCOUNT_KEY = '__etax_helper_last_login_account_v1';
 const { createEncryptedVault, unlockEncryptedVault, encryptPayloadWithKey, decryptPayloadWithKey } = __require("security/crypto-vault.js");
 const { saveUnlockedSession, getActiveSession, lockSessionNow } = __require("security/session-unlock.js");
 
@@ -1414,6 +1827,132 @@ function resetVaultCompletely() {
   lockSessionNow();
 }
 
+/**
+ * Ghi nhớ tài khoản vừa chọn ở màn hình Quick Login (`0101234567-QL` vs `-KT`)
+ * để Thanh định danh v2 ưu tiên khớp đúng tài khoản khi Header chỉ hiển thị MST 10 số.
+ */
+function rememberLastLoginAccount(account, mst) {
+  try {
+    if (typeof window !== 'undefined' && window.sessionStorage) {
+      window.sessionStorage.setItem(
+        LAST_LOGIN_ACCOUNT_KEY,
+        JSON.stringify({
+          account: String(account || '').trim(),
+          mst: String(mst || '').trim(),
+          ts: Date.now(),
+        }),
+      );
+    }
+  } catch {
+    // ignore storage errors
+  }
+}
+
+function getLastLoginAccount() {
+  try {
+    if (typeof window !== 'undefined' && window.sessionStorage) {
+      const raw = window.sessionStorage.getItem(LAST_LOGIN_ACCOUNT_KEY);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      return parsed && typeof parsed === 'object' ? parsed : null;
+    }
+  } catch {
+    // ignore
+  }
+  return null;
+}
+
+/**
+ * Tìm bản ghi công ty khớp nhất trong Vault:
+ * 1. Khớp chính xác `account` (nếu có và trùng MST)
+ * 2. Fallback khớp chính xác `mst`
+ * 3. Fallback khớp tiền tố `account` bắt đầu bằng `mst` (VD `0101234567-QL`)
+ */
+function findMatchingCompany(companies, { account = '', mst = '' } = {}) {
+  if (!Array.isArray(companies) || companies.length === 0) return null;
+  const targetAccount = String(account || '').trim().toUpperCase();
+  const targetMst = String(mst || '').trim().toUpperCase();
+
+  if (targetAccount) {
+    const exactAcc = companies.find(
+      (c) => String(c.account || '').trim().toUpperCase() === targetAccount,
+    );
+    if (exactAcc) {
+      if (!targetMst || String(exactAcc.mst || '').trim().toUpperCase() === targetMst) {
+        return exactAcc;
+      }
+    }
+  }
+
+  if (targetMst) {
+    const byMst = companies.find(
+      (c) => String(c.mst || '').trim().toUpperCase() === targetMst,
+    );
+    if (byMst) return byMst;
+
+    const byPrefix = companies.find((c) => {
+      const acc = String(c.account || '').trim().toUpperCase();
+      return acc === targetMst || acc.startsWith(`${targetMst}-`);
+    });
+    if (byPrefix) return byPrefix;
+  }
+
+  return null;
+}
+
+/**
+ * Cập nhật ghi chú nguyên tử (Read-Modify-Write) trực tiếp vào Vault mã hóa PIN `etax_vault_v1`:
+ * - Luôn đọc & giải mã mới nhất từ GM_getValue ngay trước khi ghi để chống Race Condition khi mở nhiều tab!
+ * - Giữ đồng bộ 100% với cột 5 "Ghi chú" khi Import/Export Excel của v1.
+ */
+async function updateCompanyNoteAtomic({ account = '', mst = '' }, newNote) {
+  const vaultRecord = getValue(STORAGE_KEYS.VAULT, null);
+  if (!vaultRecord) {
+    return { updated: false, reason: 'uninitialized' };
+  }
+  const session = await getActiveSession();
+  if (!session) {
+    return { updated: false, reason: 'locked' };
+  }
+
+  let data;
+  try {
+    data = await decryptPayloadWithKey(vaultRecord, session.key);
+  } catch {
+    lockSessionNow();
+    return { updated: false, reason: 'locked' };
+  }
+
+  const companies = Array.isArray(data.companies) ? data.companies : [];
+  const matched = findMatchingCompany(companies, { account, mst });
+  if (!matched) {
+    return { updated: false, reason: 'not-found' };
+  }
+
+  const cleanedNote = String(newNote ?? '').trim();
+  const nextCompanies = companies.map((item) =>
+    item.id === matched.id ? { ...item, note: cleanedNote } : item,
+  );
+
+  const nextRecord = await encryptPayloadWithKey(
+    { version: 1, companies: nextCompanies },
+    session.key,
+    session.saltBytes,
+    session.iterations,
+  );
+  setValue(STORAGE_KEYS.VAULT, nextRecord);
+
+  const updatedCompany = { ...matched, note: cleanedNote };
+  return { updated: true, company: updatedCompany, companies: nextCompanies };
+}
+
+function onVaultChange(callback) {
+  const id = addValueChangeListener(STORAGE_KEYS.VAULT, (_k, _oldVal, newVal) => {
+    callback(newVal);
+  });
+  return () => removeValueChangeListener(id);
+}
+
   __exports.setupNewVault = setupNewVault;
   __exports.unlockVaultWithPin = unlockVaultWithPin;
   __exports.tryLoadUnlockedCompanies = tryLoadUnlockedCompanies;
@@ -1421,10 +1960,15 @@ function resetVaultCompletely() {
   __exports.rollbackPreviousImport = rollbackPreviousImport;
   __exports.changeVaultPin = changeVaultPin;
   __exports.importEncryptedVaultBackup = importEncryptedVaultBackup;
+  __exports.updateCompanyNoteAtomic = updateCompanyNoteAtomic;
   __exports.hasVault = hasVault;
   __exports.hasImportBackup = hasImportBackup;
   __exports.getRawVaultRecord = getRawVaultRecord;
   __exports.resetVaultCompletely = resetVaultCompletely;
+  __exports.rememberLastLoginAccount = rememberLastLoginAccount;
+  __exports.getLastLoginAccount = getLastLoginAccount;
+  __exports.findMatchingCompany = findMatchingCompany;
+  __exports.onVaultChange = onVaultChange;
   },
 
   "features/quick-login/xlsx-codec.js": function(__require, __exports) {
@@ -3110,7 +3654,7 @@ function openCompanyManagerModal({
 const { isLoginPage, findLoginFormContext, setNativeInputValue, normalizeVietnamese } = __require("adapters/etax-adapter.js");
 const { createDomWatcher } = __require("core/dom-observer.js");
 const { createShadowMount } = __require("ui/shadow-host.js");
-const { tryLoadUnlockedCompanies, unlockVaultWithPin } = __require("features/quick-login/company-store.js");
+const { tryLoadUnlockedCompanies, unlockVaultWithPin, rememberLastLoginAccount } = __require("features/quick-login/company-store.js");
 const { lockSessionNow, onSessionStateChange } = __require("security/session-unlock.js");
 const { openCompanyManagerModal } = __require("features/quick-login/manager-modal.js");
 
@@ -3225,6 +3769,7 @@ function createQuickLoginFeature() {
     if (!ctx) return;
 
     const loginUsername = company.account || `${company.mst}-QL`;
+    rememberLastLoginAccount(loginUsername, company.mst);
     setNativeInputValue(ctx.usernameInput, loginUsername);
     setNativeInputValue(ctx.passwordInput, company.password);
 
@@ -4580,10 +5125,20 @@ async function sendSilentKeepAlive() {
   __exports.sendSilentKeepAlive = sendSilentKeepAlive;
   },
 
-  "features/session-timer/timer-widget.js": function(__require, __exports) {
+  "ui/unified-dock.js": function(__require, __exports) {
 const { createShadowMount } = __require("ui/shadow-host.js");
+const { STORAGE_KEYS, getValue, setValue } = __require("core/storage.js");
+const { isLoggedIn } = __require("adapters/etax-adapter.js");
+const { isTopFrame } = __require("core/frame-bus.js");
 
-const WIDGET_CSS = `
+/**
+ * Unified Dock (Top-Frame `dichvucong.gdt.gov.vn` góc dưới-trái):
+ * - Hợp nhất 4 module Top-Frame (Định danh Cty + Ghi chú | Truy cập nhanh | Đèn Ký số | Đồng hồ phiên)
+ *   vào duy nhất 01 thanh nổi Shadow DOM có thể thu gọn thành thẻ Pill gọn gàng.
+ * - Mỗi slot cập nhật DOM độc lập -> đồng hồ đếm từng giây KHÔNG làm mất focus của ô ghi chú hay ô tìm kiếm!
+ */
+
+const DOCK_CSS = `
 @keyframes eh-pulse-red {
   0%, 100% {
     background: #dc2626;
@@ -4591,10 +5146,10 @@ const WIDGET_CSS = `
   }
   50% {
     background: #b91c1c;
-    box-shadow: 0 0 0 8px rgba(220, 38, 38, 0);
+    box-shadow: 0 0 0 7px rgba(220, 38, 38, 0);
   }
 }
-.eh-timer-wrap {
+.eh-dock-wrap {
   position: fixed;
   bottom: 14px;
   left: 14px;
@@ -4602,70 +5157,507 @@ const WIDGET_CSS = `
   display: flex;
   flex-direction: column;
   align-items: flex-start;
-  gap: 6px;
+  gap: 8px;
+  max-width: calc(100vw - 140px);
 }
-.eh-timer-pill {
+.eh-dock-popover {
+  display: none;
+  background: #ffffff;
+  border: 1px solid #cbd5e1;
+  border-radius: 12px;
+  box-shadow: 0 16px 38px rgba(15, 23, 42, 0.22);
+  padding: 12px 14px;
+  min-width: 260px;
+  max-width: min(520px, calc(100vw - 32px));
+  max-height: min(72vh, 540px);
+  overflow-y: auto;
+  color: #0f172a;
+}
+.eh-dock-popover.open {
+  display: block;
+}
+.eh-dock-bar {
   display: inline-flex;
   align-items: center;
-  gap: 7px;
-  padding: 6px 12px;
+  gap: 2px;
+  padding: 4px 6px;
   border-radius: 999px;
   border: 1.5px solid #006FBC;
-  background: rgba(255, 255, 255, 0.96);
+  background: rgba(255, 255, 255, 0.97);
+  box-shadow: 0 6px 20px rgba(15, 23, 42, 0.16);
+  backdrop-filter: blur(6px);
+  user-select: none;
+  flex-wrap: nowrap;
+  max-width: 100%;
+}
+.eh-dock-slot {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.eh-dock-slot:empty {
+  display: none;
+}
+.eh-dock-sep {
+  width: 1px;
+  height: 18px;
+  background: #e2e8f0;
+  margin: 0 4px;
+  flex-shrink: 0;
+}
+.eh-dock-bar.collapsed .eh-hide-collapsed {
+  display: none !important;
+}
+.eh-dock-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  border-radius: 999px;
+  border: none;
+  background: transparent;
+  color: #0f172a;
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+  line-height: 1.25;
+  transition: background 0.14s, color 0.14s;
+}
+.eh-dock-chip:hover {
+  background: #eff6ff;
   color: #006FBC;
-  font-size: 13px;
+}
+.eh-dock-chip.active {
+  background: #dbeafe;
+  color: #005a99;
+}
+.eh-dock-collapse-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 999px;
+  border: none;
+  background: #f1f5f9;
+  color: #475569;
+  font-size: 12px;
   font-weight: 700;
   cursor: pointer;
-  box-shadow: 0 4px 16px rgba(15, 23, 42, 0.16);
-  user-select: none;
-  transition: transform 0.12s;
+  flex-shrink: 0;
+  margin-left: 2px;
 }
-.eh-timer-pill:hover {
-  transform: translateY(-1px);
+.eh-dock-collapse-btn:hover {
+  background: #e2e8f0;
+  color: #0f172a;
 }
-.eh-timer-pill.warning {
-  border-color: #991b1b;
+.eh-mst-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  box-shadow: 0 0 0 2px rgba(15, 23, 42, 0.08);
+}
+.eh-co-name {
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+  color: #1e293b;
+}
+.eh-dock-bar.collapsed .eh-co-name {
+  max-width: 96px;
+}
+.eh-note-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #f59e0b;
+  margin-left: -2px;
+}
+.eh-timer-chip {
+  color: #006FBC;
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+}
+.eh-timer-chip.warning {
+  background: #dc2626;
   color: #ffffff;
   animation: eh-pulse-red 1.1s infinite;
 }
-.eh-timer-pill.expired {
-  border-color: #7f1d1d;
+.eh-timer-chip.warning:hover {
+  background: #b91c1c;
+  color: #ffffff;
+}
+.eh-timer-chip.expired {
   background: #450a0a;
   color: #fecaca;
 }
-.eh-timer-pill.idle-paused {
-  border-color: #b45309;
+.eh-timer-chip.idle-paused {
   background: #fffbeb;
   color: #92400e;
 }
-.eh-timer-pop {
-  width: 248px;
-  background: #ffffff;
-  border: 1px solid #cbd5e1;
-  border-radius: 10px;
-  padding: 10px 12px;
-  box-shadow: 0 12px 30px rgba(15, 23, 42, 0.2);
+.eh-sign-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+  flex-shrink: 0;
 }
-.eh-timer-pop-title {
-  font-size: 12.5px;
-  font-weight: 700;
-  color: #006FBC;
-  margin-bottom: 8px;
-}
-.eh-timer-row {
+.eh-sign-dot.online { background: #16a34a; box-shadow: 0 0 0 2px rgba(22, 163, 74, 0.22); }
+.eh-sign-dot.offline { background: #dc2626; box-shadow: 0 0 0 2px rgba(220, 38, 38, 0.22); }
+.eh-sign-dot.checking { background: #f59e0b; }
+.eh-sign-dot.unknown { background: #94a3b8; }
+.eh-pop-head {
   display: flex;
   align-items: center;
-  gap: 6px;
+  justify-content: space-between;
+  gap: 8px;
+  padding-bottom: 8px;
+  margin-bottom: 10px;
+  border-bottom: 1px solid #e2e8f0;
 }
-.eh-timer-meta {
-  margin-top: 8px;
-  padding-top: 6px;
-  border-top: 1px solid #f1f5f9;
-  font-size: 11.5px;
-  color: #64748b;
-  line-height: 1.45;
+.eh-pop-title {
+  font-size: 13px;
+  font-weight: 700;
+  color: #006FBC;
+}
+.eh-pop-close {
+  border: none;
+  background: #f1f5f9;
+  color: #475569;
+  border-radius: 6px;
+  width: 24px;
+  height: 24px;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 700;
+}
+.eh-pop-close:hover { background: #e2e8f0; color: #0f172a; }
+.eh-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  background: #eff6ff;
+  color: #006FBC;
+  border: 1px solid #bfdbfe;
+}
+.eh-badge-warn {
+  background: #fffbeb;
+  color: #b45309;
+  border-color: #fde68a;
+}
+.eh-badge-ok {
+  background: #f0fdf4;
+  color: #15803d;
+  border-color: #bbf7d0;
+}
+.eh-badge-err {
+  background: #fef2f2;
+  color: #b91c1c;
+  border-color: #fecaca;
 }
 `;
+
+const SLOT_ORDER = ['company', 'quickAccess', 'signing', 'timer'];
+
+let host = null;
+let shadow = null;
+let root = null;
+let cleanupMount = null;
+let dockBarEl = null;
+let popoverEl = null;
+let collapseBtnEl = null;
+let extraStylesLoaded = new Set();
+
+const slotContainers = new Map();
+const slotSeparators = new Map();
+const activeSlots = new Set();
+
+let collapsed = false;
+let activePopoverId = null;
+let onPopoverCloseCb = null;
+let outsideClickBound = false;
+
+function loadCollapsedState() {
+  const saved = getValue(STORAGE_KEYS.DOCK_UI_STATE, null);
+  return Boolean(saved && typeof saved === 'object' && saved.collapsed);
+}
+
+function saveCollapsedState(val) {
+  setValue(STORAGE_KEYS.DOCK_UI_STATE, { schemaVersion: 1, collapsed: Boolean(val) });
+}
+
+function syncSeparators() {
+  if (!dockBarEl) return;
+  let seenVisible = false;
+  for (const name of SLOT_ORDER) {
+    const el = slotContainers.get(name);
+    const sep = slotSeparators.get(name);
+    const hasContent = Boolean(el && activeSlots.has(name) && el.childNodes.length > 0);
+    if (el) el.style.display = hasContent ? 'inline-flex' : 'none';
+    if (sep) {
+      sep.style.display = hasContent && seenVisible ? 'inline-block' : 'none';
+    }
+    if (hasContent) seenVisible = true;
+  }
+
+  if (collapseBtnEl) {
+    // Ẩn nút thu gọn nếu chỉ có duy nhất 1 slot (VD chỉ bật đồng hồ phiên)
+    collapseBtnEl.style.display = activeSlots.size >= 2 ? 'inline-flex' : 'none';
+  }
+}
+
+function applyCollapsedUi() {
+  if (!dockBarEl || !collapseBtnEl) return;
+  dockBarEl.classList.toggle('collapsed', collapsed);
+  collapseBtnEl.textContent = collapsed ? '▸' : '◂';
+  collapseBtnEl.title = collapsed ? 'Mở rộng thanh eTax Helper' : 'Thu gọn thành thẻ nhỏ (Pill)';
+}
+
+function onDocumentPointerDown(event) {
+  if (!activePopoverId || !host) return;
+  const path = typeof event.composedPath === 'function' ? event.composedPath() : [];
+  if (path.includes(host) || host.contains(event.target)) return;
+  closeDockPopover();
+}
+
+function onWindowKeyDown(event) {
+  if (event.key === 'Escape' && activePopoverId) {
+    closeDockPopover();
+  }
+}
+
+function ensureMounted() {
+  if (!isTopFrame()) return false;
+  if (!isLoggedIn(document, location)) {
+    unmountDockIfNeeded();
+    return false;
+  }
+  if (activeSlots.size === 0) {
+    unmountDockIfNeeded();
+    return false;
+  }
+  if (host && document.body?.contains(host)) {
+    return true;
+  }
+
+  collapsed = loadCollapsedState();
+  extraStylesLoaded = new Set();
+
+  const m = createShadowMount(
+    'div',
+    DOCK_CSS,
+    { 'data-etax-role': 'unified-dock' },
+    { guardBootstrapFocusTrap: true },
+  );
+  host = m.host;
+  shadow = m.shadow;
+  root = m.root;
+  cleanupMount = m.cleanup;
+
+  const wrap = document.createElement('div');
+  wrap.className = 'eh-dock-wrap';
+
+  popoverEl = document.createElement('div');
+  popoverEl.className = 'eh-dock-popover';
+
+  dockBarEl = document.createElement('div');
+  dockBarEl.className = 'eh-dock-bar';
+
+  slotContainers.clear();
+  slotSeparators.clear();
+
+  for (const name of SLOT_ORDER) {
+    const sep = document.createElement('span');
+    sep.className = 'eh-dock-sep';
+    sep.style.display = 'none';
+    dockBarEl.appendChild(sep);
+    slotSeparators.set(name, sep);
+
+    const slot = document.createElement('div');
+    slot.className = `eh-dock-slot eh-slot-${name}`;
+    slot.style.display = 'none';
+    dockBarEl.appendChild(slot);
+    slotContainers.set(name, slot);
+  }
+
+  collapseBtnEl = document.createElement('button');
+  collapseBtnEl.type = 'button';
+  collapseBtnEl.className = 'eh-dock-collapse-btn';
+  collapseBtnEl.addEventListener('click', () => {
+    collapsed = !collapsed;
+    saveCollapsedState(collapsed);
+    applyCollapsedUi();
+  });
+  dockBarEl.appendChild(collapseBtnEl);
+
+  wrap.appendChild(popoverEl);
+  wrap.appendChild(dockBarEl);
+  root.appendChild(wrap);
+  document.body.appendChild(host);
+
+  if (!outsideClickBound) {
+    outsideClickBound = true;
+    document.addEventListener('pointerdown', onDocumentPointerDown, true);
+    window.addEventListener('keydown', onWindowKeyDown, false);
+  }
+
+  applyCollapsedUi();
+  syncSeparators();
+  return true;
+}
+
+function unmountDockIfNeeded() {
+  if (activePopoverId) {
+    closeDockPopover();
+  }
+  if (outsideClickBound) {
+    outsideClickBound = false;
+    document.removeEventListener('pointerdown', onDocumentPointerDown, true);
+    window.removeEventListener('keydown', onWindowKeyDown, false);
+  }
+  if (cleanupMount) {
+    cleanupMount();
+    cleanupMount = null;
+  }
+  if (host) {
+    host.remove();
+    host = null;
+    shadow = null;
+    root = null;
+    dockBarEl = null;
+    popoverEl = null;
+    collapseBtnEl = null;
+    slotContainers.clear();
+    slotSeparators.clear();
+    extraStylesLoaded.clear();
+  }
+}
+
+function injectDockStyle(styleId, cssText) {
+  if (!shadow || extraStylesLoaded.has(styleId)) return;
+  const st = document.createElement('style');
+  st.setAttribute('data-style-id', styleId);
+  st.textContent = cssText;
+  shadow.appendChild(st);
+  extraStylesLoaded.add(styleId);
+}
+
+function activateDockSlot(slotName) {
+  activeSlots.add(slotName);
+  if (!ensureMounted()) return null;
+  syncSeparators();
+  return slotContainers.get(slotName) || null;
+}
+
+function deactivateDockSlot(slotName) {
+  activeSlots.delete(slotName);
+  const el = slotContainers.get(slotName);
+  if (el) {
+    el.innerHTML = '';
+  }
+  if (activePopoverId === slotName) {
+    closeDockPopover();
+  }
+  if (activeSlots.size === 0) {
+    unmountDockIfNeeded();
+  } else {
+    syncSeparators();
+  }
+}
+
+function getDockSlotContainer(slotName) {
+  if (!activeSlots.has(slotName)) return null;
+  if (!ensureMounted()) return null;
+  return slotContainers.get(slotName) || null;
+}
+
+function notifyDockSlotUpdated(slotName) {
+  if (!activeSlots.has(slotName)) return;
+  if (ensureMounted()) {
+    syncSeparators();
+  }
+}
+
+function openDockPopover(popoverId, renderFn, { onClose, maxWidth } = {}) {
+  if (!ensureMounted() || !popoverEl) return null;
+  if (activePopoverId && activePopoverId !== popoverId && typeof onPopoverCloseCb === 'function') {
+    const prevClose = onPopoverCloseCb;
+    onPopoverCloseCb = null;
+    prevClose();
+  }
+  activePopoverId = popoverId;
+  onPopoverCloseCb = onClose || null;
+  popoverEl.style.maxWidth = maxWidth || '';
+  popoverEl.innerHTML = '';
+  popoverEl.classList.add('open');
+  if (typeof renderFn === 'function') {
+    renderFn(popoverEl);
+  }
+  return popoverEl;
+}
+
+function getActiveDockPopoverId() {
+  return activePopoverId;
+}
+
+function closeDockPopover(onlyIfId = null) {
+  if (onlyIfId && activePopoverId !== onlyIfId) return;
+  const prevClose = onPopoverCloseCb;
+  activePopoverId = null;
+  onPopoverCloseCb = null;
+  if (popoverEl) {
+    popoverEl.classList.remove('open');
+    popoverEl.innerHTML = '';
+  }
+  if (typeof prevClose === 'function') {
+    prevClose();
+  }
+}
+
+function toggleDockPopover(popoverId, renderFn, options = {}) {
+  if (activePopoverId === popoverId) {
+    closeDockPopover();
+    return false;
+  }
+  openDockPopover(popoverId, renderFn, options);
+  return true;
+}
+
+function syncDockLoginVisibility() {
+  if (!isTopFrame()) return false;
+  if (!isLoggedIn(document, location)) {
+    unmountDockIfNeeded();
+    return false;
+  }
+  if (activeSlots.size > 0) {
+    return ensureMounted();
+  }
+  return false;
+}
+
+  __exports.injectDockStyle = injectDockStyle;
+  __exports.activateDockSlot = activateDockSlot;
+  __exports.deactivateDockSlot = deactivateDockSlot;
+  __exports.getDockSlotContainer = getDockSlotContainer;
+  __exports.notifyDockSlotUpdated = notifyDockSlotUpdated;
+  __exports.openDockPopover = openDockPopover;
+  __exports.getActiveDockPopoverId = getActiveDockPopoverId;
+  __exports.closeDockPopover = closeDockPopover;
+  __exports.toggleDockPopover = toggleDockPopover;
+  __exports.syncDockLoginVisibility = syncDockLoginVisibility;
+  },
+
+  "features/session-timer/timer-widget.js": function(__require, __exports) {
+const { activateDockSlot, deactivateDockSlot, getDockSlotContainer, notifyDockSlotUpdated, toggleDockPopover, closeDockPopover, getActiveDockPopoverId } = __require("ui/unified-dock.js");
 
 function formatMMSS(totalSeconds) {
   const sec = Math.max(0, Math.floor(totalSeconds));
@@ -4674,11 +5666,17 @@ function formatMMSS(totalSeconds) {
   return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
 }
 
+function esc(str) {
+  return String(str ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
 function createTimerWidget({ onChangeMinutes, onManualResume }) {
-  let host = null;
-  let root = null;
-  let cleanupMount = null;
-  let editorOpen = false;
+  let mounted = false;
+  let pillBtn = null;
   let latestView = {
     remainingSeconds: 15 * 60,
     timeoutMinutes: 15,
@@ -4687,135 +5685,115 @@ function createTimerWidget({ onChangeMinutes, onManualResume }) {
     lastResetText: '',
   };
 
-  const render = () => {
-    if (!root) return;
-    const { remainingSeconds, timeoutMinutes, status, lastKeepAliveText, lastResetText } = latestView;
-
-    let pillCls = 'eh-timer-pill';
+  const getVisualState = () => {
+    const { remainingSeconds, status } = latestView;
+    let cls = 'eh-dock-chip eh-timer-chip';
     let label = `⏱ ${formatMMSS(remainingSeconds)}`;
     if (status === 'warning') {
-      pillCls += ' warning';
+      cls += ' warning';
       label = `⚠️ ${formatMMSS(remainingSeconds)}`;
     } else if (status === 'keeping-alive') {
-      pillCls += ' warning';
-      label = `🔄 Đang giữ phiên...`;
+      cls += ' warning';
+      label = '🔄 Giữ phiên...';
     } else if (status === 'expired') {
-      pillCls += ' expired';
-      label = `⛔ Phiên đã hết hạn`;
+      cls += ' expired';
+      label = '⛔ Hết phiên';
     } else if (status === 'idle-paused') {
-      pillCls += ' idle-paused';
-      label = `⏸ ${formatMMSS(remainingSeconds)} (Tạm dừng giữ phiên)`;
+      cls += ' idle-paused';
+      label = `⏸ ${formatMMSS(remainingSeconds)}`;
     }
+    return { cls, label };
+  };
 
-    root.innerHTML = `
-      <div class="eh-timer-wrap">
-        ${
-          editorOpen
-            ? `
-          <div class="eh-timer-pop">
-            <div class="eh-timer-pop-title">⏱ Cài đặt đồng hồ phiên (máy này)</div>
-            <div class="eh-timer-row">
-              <input type="number" min="1" max="120" class="eh-input" id="eh-tm-input" value="${timeoutMinutes}" style="width:76px;"/>
-              <span style="font-size:12.5px;">phút</span>
-              <button type="button" class="eh-btn eh-btn-primary eh-btn-sm" id="eh-tm-save">Lưu</button>
-              <button type="button" class="eh-btn eh-btn-sm" id="eh-tm-close">Đóng</button>
-            </div>
-            <div class="eh-timer-meta">
-              • Chỉ reset khi có giao tiếp thật với máy chủ thuế.<br/>
-              • Đỏ nhấp nháy &lt; 2 phút · Tự giữ phiên ngầm &lt; 15 giây.<br/>
-              ${lastResetText ? `• Reset gần nhất: ${lastResetText}<br/>` : ''}
-              ${lastKeepAliveText ? `• Giữ phiên ngầm: ${lastKeepAliveText}` : ''}
-            </div>
-          </div>
-        `
-            : ''
-        }
-        <button type="button" class="${pillCls}" id="eh-tm-pill" title="Bấm để chỉnh số phút đếm ngược phiên làm việc">
-          ${label}
-        </button>
+  const renderPopover = (popEl) => {
+    const { timeoutMinutes, lastKeepAliveText, lastResetText } = latestView;
+    popEl.innerHTML = `
+      <div class="eh-pop-head">
+        <div class="eh-pop-title">⏱ Cài đặt đồng hồ phiên (máy này)</div>
+        <button type="button" class="eh-pop-close" id="eh-tm-close" title="Đóng">×</button>
+      </div>
+      <div style="display:flex; align-items:center; gap:6px;">
+        <input type="number" min="1" max="120" class="eh-input" id="eh-tm-input" value="${timeoutMinutes}" style="width:80px;"/>
+        <span style="font-size:12.5px;">phút</span>
+        <button type="button" class="eh-btn eh-btn-primary eh-btn-sm" id="eh-tm-save">Lưu</button>
+      </div>
+      <div style="margin-top:9px; padding-top:7px; border-top:1px solid #f1f5f9; font-size:11.5px; color:#64748b; line-height:1.5;">
+        • Chỉ reset khi có giao tiếp thật với máy chủ thuế.<br/>
+        • Đỏ nhấp nháy &lt; 2 phút · Tự giữ phiên ngầm &lt; 15 giây.<br/>
+        ${lastResetText ? `• Reset gần nhất: <strong>${esc(lastResetText)}</strong><br/>` : ''}
+        ${lastKeepAliveText ? `• Giữ phiên ngầm: <strong>${esc(lastKeepAliveText)}</strong>` : ''}
       </div>
     `;
 
-    root.querySelector('#eh-tm-pill')?.addEventListener('click', () => {
-      editorOpen = !editorOpen;
-      if (status === 'idle-paused' && typeof onManualResume === 'function') {
-        onManualResume();
-      }
-      render();
-      if (editorOpen) {
-        root.querySelector('#eh-tm-input')?.focus();
-      }
-    });
-
     const save = () => {
-      const val = parseInt(root.querySelector('#eh-tm-input')?.value || '', 10);
+      const val = parseInt(popEl.querySelector('#eh-tm-input')?.value || '', 10);
       if (Number.isFinite(val) && val >= 1 && val <= 120) {
-        editorOpen = false;
+        closeDockPopover('timer');
         onChangeMinutes(val);
       }
     };
 
-    root.querySelector('#eh-tm-save')?.addEventListener('click', save);
-    root.querySelector('#eh-tm-input')?.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') save();
-      if (e.key === 'Escape') {
-        editorOpen = false;
-        render();
+    popEl.querySelector('#eh-tm-save')?.addEventListener('click', save);
+    popEl.querySelector('#eh-tm-close')?.addEventListener('click', () => closeDockPopover('timer'));
+    const input = popEl.querySelector('#eh-tm-input');
+    if (input) {
+      input.focus();
+      input.select?.();
+      input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') save();
+      });
+    }
+  };
+
+  const ensureSlotButton = () => {
+    const slot = getDockSlotContainer('timer') || activateDockSlot('timer');
+    if (!slot) return null;
+    if (pillBtn && slot.contains(pillBtn)) return pillBtn;
+
+    slot.innerHTML = '';
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.id = 'eh-tm-pill';
+    btn.title = 'Đồng hồ đếm ngược phiên làm việc — bấm để chỉnh số phút';
+    btn.addEventListener('click', () => {
+      if (latestView.status === 'idle-paused' && typeof onManualResume === 'function') {
+        onManualResume();
       }
+      toggleDockPopover('timer', renderPopover, { maxWidth: '300px' });
     });
-    root.querySelector('#eh-tm-close')?.addEventListener('click', () => {
-      editorOpen = false;
-      render();
-    });
+    slot.appendChild(btn);
+    pillBtn = btn;
+    notifyDockSlotUpdated('timer');
+    return btn;
+  };
+
+  const updateButtonInPlace = () => {
+    if (!mounted) return;
+    const btn = ensureSlotButton();
+    if (!btn) return;
+    const { cls, label } = getVisualState();
+    btn.className = cls + (getActiveDockPopoverId() === 'timer' ? ' active' : '');
+    btn.textContent = label;
   };
 
   return {
     mount() {
-      if (host && document.body?.contains(host)) return;
-      const m = createShadowMount(
-        'div',
-        WIDGET_CSS,
-        { 'data-etax-role': 'session-timer-widget' },
-        { guardBootstrapFocusTrap: true },
-      );
-      host = m.host;
-      root = m.root;
-      cleanupMount = m.cleanup;
-      document.body.appendChild(host);
-      render();
+      mounted = true;
+      activateDockSlot('timer');
+      ensureSlotButton();
+      updateButtonInPlace();
     },
 
     update(nextView) {
       latestView = { ...latestView, ...nextView };
-      if (!editorOpen) {
-        render();
-      } else if (root) {
-        const pill = root.querySelector('#eh-tm-pill');
-        if (pill) {
-          const { remainingSeconds, status } = latestView;
-          pill.textContent =
-            status === 'expired'
-              ? '⛔ Phiên đã hết hạn'
-              : status === 'keeping-alive'
-                ? '🔄 Đang giữ phiên...'
-                : status === 'warning'
-                  ? `⚠️ ${formatMMSS(remainingSeconds)}`
-                  : `⏱ ${formatMMSS(remainingSeconds)}`;
-        }
-      }
+      updateButtonInPlace();
     },
 
     unmount() {
-      editorOpen = false;
-      if (cleanupMount) {
-        cleanupMount();
-        cleanupMount = null;
-      }
-      if (host) {
-        host.remove();
-        host = null;
-        root = null;
-      }
+      mounted = false;
+      pillBtn = null;
+      closeDockPopover('timer');
+      deactivateDockSlot('timer');
     },
   };
 }
@@ -5060,6 +6038,3457 @@ function createSessionTimerFeature() {
   __exports.createSessionTimerFeature = createSessionTimerFeature;
   },
 
+  "features/company-bar/note-store.js": function(__require, __exports) {
+const { STORAGE_KEYS, getValue, setValue } = __require("core/storage.js");
+const { tryLoadUnlockedCompanies, findMatchingCompany, updateCompanyNoteAtomic, getLastLoginAccount } = __require("features/quick-login/company-store.js");
+
+const MST_PALETTE = [
+  '#0284c7', // Sky Blue
+  '#0d9488', // Teal
+  '#7c3aed', // Violet
+  '#d97706', // Amber
+  '#059669', // Emerald
+  '#e11d48', // Rose
+  '#2563eb', // Royal Blue
+  '#ea580c', // Orange
+  '#4f46e5', // Indigo
+  '#c026d3', // Fuchsia
+];
+
+/**
+ * Sinh màu nhận diện cố định theo MST giúp mắt nhận ra ngay nếu đang mở nhầm công ty.
+ */
+function getMstAccentColor(mst) {
+  const s = String(mst || '').trim();
+  if (!s) return '#006FBC';
+  let hash = 2166136261;
+  for (let i = 0; i < s.length; i++) {
+    hash ^= s.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  const idx = (hash >>> 0) % MST_PALETTE.length;
+  return MST_PALETTE[idx];
+}
+
+function normalizeMstKey(mst) {
+  return String(mst || '').trim().toUpperCase();
+}
+
+function readExtraNotesStore() {
+  const raw = getValue(STORAGE_KEYS.EXTRA_NOTES, null);
+  if (!raw || typeof raw !== 'object' || !raw.byMst || typeof raw.byMst !== 'object') {
+    return { schemaVersion: 1, byMst: {} };
+  }
+  return { schemaVersion: 1, byMst: { ...raw.byMst } };
+}
+
+function getExtraNote(mst) {
+  const key = normalizeMstKey(mst);
+  if (!key) return '';
+  const store = readExtraNotesStore();
+  const entry = store.byMst[key];
+  return entry && typeof entry.note === 'string' ? entry.note : '';
+}
+
+function saveExtraNote(mst, note) {
+  const key = normalizeMstKey(mst);
+  if (!key) return '';
+  const store = readExtraNotesStore();
+  const cleaned = String(note ?? '').trim();
+  if (!cleaned) {
+    delete store.byMst[key];
+  } else {
+    store.byMst[key] = {
+      note: cleaned,
+      updatedAt: new Date().toISOString(),
+    };
+  }
+  setValue(STORAGE_KEYS.EXTRA_NOTES, store);
+  return cleaned;
+}
+
+function resolveAccountHintForMst(mst) {
+  const last = getLastLoginAccount();
+  const targetMst = normalizeMstKey(mst);
+  if (!last || !last.account) return '';
+  if (!targetMst) return last.account;
+  const lastMst = normalizeMstKey(last.mst);
+  const lastAcc = String(last.account).trim().toUpperCase();
+  if (lastMst === targetMst || lastAcc === targetMst || lastAcc.startsWith(`${targetMst}-`)) {
+    return last.account;
+  }
+  return '';
+}
+
+/**
+ * Tải ngữ cảnh Ghi chú cho công ty đang đăng nhập:
+ * - Ưu tiên Vault mã hóa PIN (`etax_vault_v1`) làm nguồn chính.
+ * - Fallback kho ghi chú phụ cục bộ (`etax_extra_notes_v1`) cho MST chưa có trong Vault.
+ */
+async function loadCompanyNoteContext({ mst = '', account = '' } = {}) {
+  const effectiveAccount = account || resolveAccountHintForMst(mst);
+  const extraNote = getExtraNote(mst);
+  const vaultRes = await tryLoadUnlockedCompanies();
+
+  if (vaultRes.state === 'unlocked') {
+    const matched = findMatchingCompany(vaultRes.companies, {
+      account: effectiveAccount,
+      mst,
+    });
+    if (matched) {
+      return {
+        source: 'vault',
+        vaultState: 'unlocked',
+        company: matched,
+        note: matched.note || '',
+        extraNote,
+      };
+    }
+    return {
+      source: 'extra',
+      vaultState: 'unlocked',
+      company: null,
+      note: extraNote,
+      extraNote,
+    };
+  }
+
+  if (vaultRes.state === 'locked') {
+    return {
+      source: 'locked',
+      vaultState: 'locked',
+      company: null,
+      note: extraNote,
+      extraNote,
+    };
+  }
+
+  return {
+    source: 'extra',
+    vaultState: 'uninitialized',
+    company: null,
+    note: extraNote,
+    extraNote,
+  };
+}
+
+/**
+ * Lưu ghi chú cho công ty hiện tại (ưu tiên ghi nguyên tử vào Vault PIN, fallback kho ghi chú phụ).
+ */
+async function saveCompanyNote({ mst = '', account = '', preferExtra = false }, newNote) {
+  const effectiveAccount = account || resolveAccountHintForMst(mst);
+  if (!preferExtra) {
+    const res = await updateCompanyNoteAtomic({ account: effectiveAccount, mst }, newNote);
+    if (res.updated) {
+      return {
+        ok: true,
+        source: 'vault',
+        company: res.company,
+        note: res.company.note || '',
+      };
+    }
+    if (res.reason === 'locked') {
+      return { ok: false, reason: 'locked' };
+    }
+  }
+
+  const saved = saveExtraNote(mst, newNote);
+  return {
+    ok: true,
+    source: 'extra',
+    company: null,
+    note: saved,
+  };
+}
+
+function publishActiveCompanyContext({ mst = '', companyName = '', personalId = '' } = {}) {
+  if (!mst && !companyName) return;
+  const prev = getValue(STORAGE_KEYS.ACTIVE_COMPANY_CTX, null);
+  if (prev && prev.mst === mst && prev.companyName === companyName && prev.personalId === personalId) {
+    return;
+  }
+  setValue(STORAGE_KEYS.ACTIVE_COMPANY_CTX, {
+    mst: String(mst || '').trim(),
+    companyName: String(companyName || '').trim(),
+    personalId: String(personalId || '').trim(),
+    updatedAt: Date.now(),
+  });
+}
+
+function getActiveCompanyContext() {
+  const ctx = getValue(STORAGE_KEYS.ACTIVE_COMPANY_CTX, null);
+  return ctx && typeof ctx === 'object' ? ctx : { mst: '', companyName: '', personalId: '' };
+}
+
+  __exports.loadCompanyNoteContext = loadCompanyNoteContext;
+  __exports.saveCompanyNote = saveCompanyNote;
+  __exports.getMstAccentColor = getMstAccentColor;
+  __exports.getExtraNote = getExtraNote;
+  __exports.saveExtraNote = saveExtraNote;
+  __exports.resolveAccountHintForMst = resolveAccountHintForMst;
+  __exports.publishActiveCompanyContext = publishActiveCompanyContext;
+  __exports.getActiveCompanyContext = getActiveCompanyContext;
+  },
+
+  "features/company-bar/index.js": function(__require, __exports) {
+const { isLoggedIn, extractLoggedInCompany } = __require("adapters/etax-adapter.js");
+const { isTopFrame } = __require("core/frame-bus.js");
+const { createDomWatcher } = __require("core/dom-observer.js");
+const { activateDockSlot, deactivateDockSlot, getDockSlotContainer, notifyDockSlotUpdated, toggleDockPopover, openDockPopover, closeDockPopover, getActiveDockPopoverId } = __require("ui/unified-dock.js");
+const { unlockVaultWithPin, onVaultChange } = __require("features/quick-login/company-store.js");
+const { onSessionStateChange } = __require("security/session-unlock.js");
+const { getMstAccentColor, loadCompanyNoteContext, saveCompanyNote, publishActiveCompanyContext } = __require("features/company-bar/note-store.js");
+
+function esc(str) {
+  return String(str ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function shortenCompanyName(name) {
+  const cleaned = String(name || '')
+    .replace(/^công\s*ty\s*(tnhh|cổ\s*phần|cp|hợp\s*danh|tư\s*nhân)\s*/i, '')
+    .replace(/^(sx|tm|dv|thương\s*mại|sản\s*xuất|dịch\s*vụ)(\s*(&|và)\s*(sx|tm|dv|thương\s*mại|sản\s*xuất|dịch\s*vụ))*\s*/i, '')
+    .trim();
+  return cleaned || String(name || '').trim() || 'Chưa rõ tên DN';
+}
+
+function createCompanyBarFeature() {
+  let active = false;
+  let watcher = null;
+  let unsubVault = null;
+  let unsubSession = null;
+
+  let currentInfo = { mst: '', companyName: '', personalId: '', isOrganization: false };
+  let noteCtx = { source: 'extra', vaultState: 'uninitialized', company: null, note: '', extraNote: '' };
+  let preferExtraWhileLocked = false;
+  let feedback = null; // { type: 'success' | 'error', text }
+
+  const renderSlot = () => {
+    if (!active) return;
+    if (!isLoggedIn(document, location)) {
+      deactivateDockSlot('company');
+      return;
+    }
+
+    const slot = getDockSlotContainer('company') || activateDockSlot('company');
+    if (!slot) return;
+
+    const mst = currentInfo.mst || '---';
+    const fullName = noteCtx.company?.companyName || currentInfo.companyName || 'Đang nhận diện...';
+    const shortName = shortenCompanyName(fullName);
+    const accent = getMstAccentColor(mst);
+    const hasNote = Boolean((noteCtx.note || '').trim() || (noteCtx.extraNote || '').trim());
+    const popOpen = getActiveDockPopoverId() === 'company';
+
+    slot.innerHTML = `
+      <button type="button" class="eh-dock-chip ${popOpen ? 'active' : ''}" id="eh-co-chip"
+        title="${esc(fullName)} — MST: ${esc(mst)} (Bấm để xem/sửa Ghi chú & Copy MST)">
+        <span class="eh-mst-dot" style="background:${accent};"></span>
+        <span style="font-variant-numeric:tabular-nums; color:${accent};">${esc(mst)}</span>
+        <span class="eh-co-name">· ${esc(shortName)}</span>
+      </button>
+      <button type="button" class="eh-dock-chip eh-hide-collapsed ${popOpen ? 'active' : ''}" id="eh-co-note-btn"
+        title="Mở pop-up xem & sửa nhanh Ghi chú công ty">
+        📝 <span style="font-weight:600;">Ghi chú</span>${hasNote ? '<span class="eh-note-dot" title="Công ty này có ghi chú"></span>' : ''}
+      </button>
+    `;
+
+    const onOpen = () => {
+      feedback = null;
+      toggleDockPopover('company', renderNotePopover, {
+        maxWidth: '420px',
+        onClose: () => renderSlot(),
+      });
+      renderSlot();
+    };
+
+    slot.querySelector('#eh-co-chip')?.addEventListener('click', onOpen);
+    slot.querySelector('#eh-co-note-btn')?.addEventListener('click', onOpen);
+    notifyDockSlotUpdated('company');
+  };
+
+  const renderNotePopover = (popEl) => {
+    const mst = currentInfo.mst || '';
+    const fullName = noteCtx.company?.companyName || currentInfo.companyName || 'Chưa rõ tên công ty';
+    const accent = getMstAccentColor(mst);
+    const showPinGate = noteCtx.vaultState === 'locked' && !preferExtraWhileLocked;
+
+    let sourceBadge = '';
+    if (noteCtx.source === 'vault') {
+      sourceBadge = `<span class="eh-badge eh-badge-ok">🔒 Kho MST mã hóa PIN (${esc(noteCtx.company?.account || mst)}) · Đồng bộ Excel</span>`;
+    } else if (noteCtx.vaultState === 'locked') {
+      sourceBadge = '<span class="eh-badge eh-badge-warn">🔒 Kho PIN đang khóa</span>';
+    } else {
+      sourceBadge = '<span class="eh-badge eh-badge-warn">📌 Ghi chú phụ theo MST (chưa có trong Kho MST)</span>';
+    }
+
+    const bodyHtml = showPinGate
+      ? `
+        <div style="margin-bottom:8px; font-size:12px; color:#475569;">
+          Kho MST đang khóa. Nhập mã PIN 1 lần để xem &amp; sửa ghi chú đồng bộ với Kho MST v1:
+        </div>
+        <div style="display:flex; gap:6px; align-items:center;">
+          <input type="password" class="eh-input" id="eh-co-pin" placeholder="Nhập mã PIN mở khóa..." autocomplete="current-password"/>
+          <button type="button" class="eh-btn eh-btn-primary" id="eh-co-pin-btn" style="white-space:nowrap;">Mở khóa</button>
+        </div>
+        ${
+          noteCtx.extraNote
+            ? `<div style="margin-top:8px; padding:6px 8px; background:#fffbeb; border:1px solid #fde68a; border-radius:6px; font-size:12px;">
+                <strong>Ghi chú phụ đang có:</strong> ${esc(noteCtx.extraNote)}
+              </div>`
+            : ''
+        }
+        <div style="margin-top:8px; text-align:right;">
+          <button type="button" class="eh-btn eh-btn-sm" id="eh-co-use-extra">Ghi chú phụ không cần PIN</button>
+        </div>
+      `
+      : `
+        ${
+          noteCtx.source === 'vault' && !noteCtx.note && noteCtx.extraNote
+            ? `<div style="margin-bottom:8px; padding:6px 8px; background:#fffbeb; border:1px solid #fde68a; border-radius:6px; font-size:12px; display:flex; align-items:center; justify-content:space-between; gap:8px;">
+                <span>Có ghi chú phụ cũ: <em>${esc(noteCtx.extraNote.slice(0, 60))}</em></span>
+                <button type="button" class="eh-btn eh-btn-sm" id="eh-co-pull-extra">Nạp vào</button>
+              </div>`
+            : ''
+        }
+        <label for="eh-co-note-ta" style="display:block; font-size:12px; font-weight:600; color:#334155; margin-bottom:4px;">
+          Ghi chú khách hàng (Ctrl + Enter để lưu nhanh):
+        </label>
+        <textarea id="eh-co-note-ta" class="eh-input" rows="4" style="resize:vertical; line-height:1.45;"
+          placeholder="VD: Kê khai GTGT theo Quý, Chương 854, gửi báo cáo cho anh A trước ngày 15...">${esc(noteCtx.note || '')}</textarea>
+        <div style="margin-top:8px; display:flex; align-items:center; justify-content:space-between; gap:8px;">
+          ${
+            noteCtx.vaultState === 'locked' && preferExtraWhileLocked
+              ? '<button type="button" class="eh-btn eh-btn-sm" id="eh-co-back-pin">🔓 Mở khóa Kho PIN</button>'
+              : '<span class="eh-muted" style="font-size:11.5px;">Lưu cục bộ trên trình duyệt</span>'
+          }
+          <div style="display:flex; gap:6px;">
+            <button type="button" class="eh-btn eh-btn-sm" id="eh-co-cancel">Đóng</button>
+            <button type="button" class="eh-btn eh-btn-primary eh-btn-sm" id="eh-co-save">💾 Lưu ghi chú</button>
+          </div>
+        </div>
+      `;
+
+    popEl.innerHTML = `
+      <div class="eh-pop-head">
+        <div class="eh-pop-title" style="display:flex; align-items:center; gap:6px;">
+          <span class="eh-mst-dot" style="background:${accent};"></span>
+          <span>Thông tin &amp; Ghi chú Công ty</span>
+        </div>
+        <button type="button" class="eh-pop-close" id="eh-co-close" title="Đóng">×</button>
+      </div>
+      <div style="margin-bottom:8px; padding:8px 10px; border-radius:8px; background:#f8fafc; border-left:3px solid ${accent};">
+        <div style="font-weight:700; font-size:13px; color:#0f172a; line-height:1.35;">${esc(fullName)}</div>
+        <div style="margin-top:4px; display:flex; align-items:center; justify-content:space-between; gap:8px; flex-wrap:wrap;">
+          <span style="font-size:12px; color:#334155;">
+            MST: <strong style="color:${accent};">${esc(mst || 'Không rõ')}</strong>
+            ${currentInfo.personalId && currentInfo.isOrganization ? ` · CCCD ĐD: ${esc(currentInfo.personalId)}` : ''}
+          </span>
+          ${mst ? '<button type="button" class="eh-btn eh-btn-sm" id="eh-co-copy-mst">📋 Copy MST</button>' : ''}
+        </div>
+      </div>
+      <div style="margin-bottom:8px;">${sourceBadge}</div>
+      ${bodyHtml}
+      ${
+        feedback
+          ? `<div class="${feedback.type === 'error' ? 'eh-error' : 'eh-success'}" style="margin-top:8px;">${esc(feedback.text)}</div>`
+          : ''
+      }
+    `;
+
+    popEl.querySelector('#eh-co-close')?.addEventListener('click', () => closeDockPopover('company'));
+    popEl.querySelector('#eh-co-cancel')?.addEventListener('click', () => closeDockPopover('company'));
+
+    popEl.querySelector('#eh-co-copy-mst')?.addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(mst);
+        feedback = { type: 'success', text: `Đã sao chép MST: ${mst}` };
+      } catch {
+        feedback = { type: 'error', text: 'Trình duyệt không cho phép sao chép tự động.' };
+      }
+      if (getActiveDockPopoverId() === 'company') renderNotePopover(popEl);
+    });
+
+    const handleUnlock = async () => {
+      const pin = popEl.querySelector('#eh-co-pin')?.value || '';
+      if (!pin) return;
+      try {
+        await unlockVaultWithPin(pin);
+        preferExtraWhileLocked = false;
+        feedback = { type: 'success', text: 'Đã mở khóa Kho MST!' };
+        await refreshNoteContext();
+        if (getActiveDockPopoverId() === 'company') {
+          openDockPopover('company', renderNotePopover, { maxWidth: '420px', onClose: () => renderSlot() });
+        }
+      } catch (err) {
+        feedback = { type: 'error', text: err?.message || 'Mã PIN không đúng.' };
+        if (getActiveDockPopoverId() === 'company') renderNotePopover(popEl);
+      }
+    };
+
+    popEl.querySelector('#eh-co-pin-btn')?.addEventListener('click', handleUnlock);
+    popEl.querySelector('#eh-co-pin')?.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        handleUnlock();
+      }
+    });
+
+    popEl.querySelector('#eh-co-use-extra')?.addEventListener('click', () => {
+      preferExtraWhileLocked = true;
+      feedback = null;
+      renderNotePopover(popEl);
+    });
+
+    popEl.querySelector('#eh-co-back-pin')?.addEventListener('click', () => {
+      preferExtraWhileLocked = false;
+      feedback = null;
+      renderNotePopover(popEl);
+    });
+
+    popEl.querySelector('#eh-co-pull-extra')?.addEventListener('click', () => {
+      const ta = popEl.querySelector('#eh-co-note-ta');
+      if (ta) {
+        ta.value = noteCtx.extraNote;
+        ta.focus();
+      }
+    });
+
+    const handleSave = async () => {
+      const ta = popEl.querySelector('#eh-co-note-ta');
+      if (!ta) return;
+      const newVal = ta.value;
+      const res = await saveCompanyNote(
+        {
+          mst,
+          account: noteCtx.company?.account || '',
+          preferExtra: noteCtx.vaultState === 'locked' && preferExtraWhileLocked,
+        },
+        newVal,
+      );
+      if (res.ok) {
+        feedback = {
+          type: 'success',
+          text:
+            res.source === 'vault'
+              ? 'Đã lưu vào Kho MST mã hóa PIN (đồng bộ Excel 5 cột).'
+              : 'Đã lưu vào kho ghi chú phụ cục bộ theo MST.',
+        };
+        await refreshNoteContext();
+        if (getActiveDockPopoverId() === 'company') renderNotePopover(popEl);
+      } else {
+        feedback = { type: 'error', text: 'Kho PIN đã bị khóa — vui lòng mở khóa PIN để lưu.' };
+        await refreshNoteContext();
+        if (getActiveDockPopoverId() === 'company') renderNotePopover(popEl);
+      }
+    };
+
+    popEl.querySelector('#eh-co-save')?.addEventListener('click', handleSave);
+    const ta = popEl.querySelector('#eh-co-note-ta');
+    if (ta) {
+      ta.addEventListener('keydown', (e) => {
+        if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+          e.preventDefault();
+          handleSave();
+        }
+      });
+    }
+  };
+
+  const refreshNoteContext = async () => {
+    if (!currentInfo.mst) return;
+    noteCtx = await loadCompanyNoteContext({ mst: currentInfo.mst });
+    renderSlot();
+  };
+
+  const scanHeader = () => {
+    if (!active) return;
+    if (!isLoggedIn(document, location)) {
+      deactivateDockSlot('company');
+      return;
+    }
+    const extracted = extractLoggedInCompany(document);
+    const changed =
+      extracted.mst !== currentInfo.mst ||
+      extracted.companyName !== currentInfo.companyName ||
+      extracted.personalId !== currentInfo.personalId;
+
+    currentInfo = extracted;
+    if (extracted.mst || extracted.companyName) {
+      publishActiveCompanyContext(extracted);
+    }
+
+    if (changed) {
+      void refreshNoteContext();
+    } else {
+      renderSlot();
+    }
+  };
+
+  return {
+    start() {
+      if (!isTopFrame()) return;
+      active = true;
+      unsubVault = onVaultChange(() => {
+        void refreshNoteContext().then(() => {
+          if (getActiveDockPopoverId() === 'company') {
+            openDockPopover('company', renderNotePopover, {
+              maxWidth: '420px',
+              onClose: () => renderSlot(),
+            });
+          }
+        });
+      });
+      unsubSession = onSessionStateChange(() => {
+        void refreshNoteContext();
+      });
+      watcher = createDomWatcher(scanHeader, { debounceMs: 200 });
+      watcher.start();
+    },
+
+    stop() {
+      active = false;
+      if (watcher) {
+        watcher.stop();
+        watcher = null;
+      }
+      if (unsubVault) {
+        unsubVault();
+        unsubVault = null;
+      }
+      if (unsubSession) {
+        unsubSession();
+        unsubSession = null;
+      }
+      closeDockPopover('company');
+      deactivateDockSlot('company');
+    },
+  };
+}
+
+  __exports.createCompanyBarFeature = createCompanyBarFeature;
+  },
+
+  "features/tax-code-helper/catalog-data.js": function(__require, __exports) {
+/**
+ * Bộ danh mục Mã Chương & Mã Tiểu mục (NDKT) cốt lõi đóng gói sẵn offline (Lớp 1).
+ * Nguồn tham chiếu: Hệ thống Mục lục Ngân sách Nhà nước (Thông tư 324/2016/TT-BTC và các sửa đổi bổ sung).
+ * Khi đồng bộ hoặc Passive Capture từ cổng thuế (Lớp 2), tên chính thức của cổng thuế sẽ được ưu tiên ghi đè.
+ */
+
+const SYNC_CORE_NDKT_GROUPS = [
+  '1000', // Thuế thu nhập cá nhân
+  '1050', // Thuế thu nhập doanh nghiệp
+  '1700', // Thuế giá trị gia tăng
+  '1750', // Thuế tiêu thụ đặc biệt
+  '2000', // Thuế bảo vệ môi trường
+  '2850', // Lệ phí QLNN liên quan đến SXKD (Lệ phí môn bài)
+  '4250', // Thu tiền phạt
+  '4900', // Các khoản thu khác (Tiền chậm nộp)
+];
+
+const DEFAULT_CHAPTER_CODES = [
+  { code: '154', name: 'Kinh tế hỗn hợp ngoài quốc doanh (Cấp Trung ương)', kind: 'enterprise' },
+  { code: '554', name: 'Kinh tế hỗn hợp ngoài quốc doanh (Cấp Tỉnh/TP)', kind: 'enterprise' },
+  { code: '754', name: 'Kinh tế hỗn hợp ngoài quốc doanh (Cấp Huyện/Quận/Khu vực)', kind: 'enterprise' },
+  { code: '854', name: 'Kinh tế hỗn hợp ngoài quốc doanh (Cấp Cơ sở / Xã / Phường)', kind: 'enterprise' },
+  { code: '155', name: 'Kinh tế có vốn đầu tư nước ngoài - FDI (Cấp Trung ương)', kind: 'enterprise' },
+  { code: '555', name: 'Kinh tế có vốn đầu tư nước ngoài - FDI (Cấp Tỉnh/TP)', kind: 'enterprise' },
+  { code: '755', name: 'Kinh tế có vốn đầu tư nước ngoài - FDI (Cấp Huyện/Khu vực)', kind: 'enterprise' },
+  { code: '855', name: 'Kinh tế có vốn đầu tư nước ngoài - FDI (Cấp Cơ sở)', kind: 'enterprise' },
+  { code: '157', name: 'Kinh tế cá thể / Hộ gia đình, cá nhân (Cấp Trung ương)', kind: 'individual' },
+  { code: '557', name: 'Kinh tế cá thể / Hộ gia đình, cá nhân (Cấp Tỉnh/TP)', kind: 'individual' },
+  { code: '757', name: 'Kinh tế cá thể / Hộ gia đình, cá nhân (Cấp Huyện/Khu vực)', kind: 'individual' },
+  { code: '857', name: 'Kinh tế cá thể / Hộ gia đình, cá nhân (Cấp Cơ sở)', kind: 'individual' },
+  { code: '151', name: 'Doanh nghiệp Nhà nước (Cấp Trung ương)', kind: 'enterprise' },
+  { code: '551', name: 'Doanh nghiệp Nhà nước (Cấp Tỉnh/TP)', kind: 'enterprise' },
+  { code: '751', name: 'Doanh nghiệp Nhà nước (Cấp Huyện)', kind: 'enterprise' },
+  { code: '152', name: 'Công ty có vốn Nhà nước trên 50% (Cấp Trung ương)', kind: 'enterprise' },
+  { code: '552', name: 'Công ty có vốn Nhà nước trên 50% (Cấp Tỉnh/TP)', kind: 'enterprise' },
+  { code: '752', name: 'Công ty có vốn Nhà nước trên 50% (Cấp Huyện)', kind: 'enterprise' },
+  { code: '153', name: 'Kinh tế tập thể / Hợp tác xã (Cấp Trung ương)', kind: 'enterprise' },
+  { code: '553', name: 'Kinh tế tập thể / Hợp tác xã (Cấp Tỉnh/TP)', kind: 'enterprise' },
+  { code: '753', name: 'Kinh tế tập thể / Hợp tác xã (Cấp Huyện)', kind: 'enterprise' },
+  { code: '853', name: 'Kinh tế tập thể / Hợp tác xã (Cấp Cơ sở)', kind: 'enterprise' },
+  { code: '158', name: 'Doanh nghiệp tư nhân (Cấp Trung ương)', kind: 'enterprise' },
+  { code: '558', name: 'Doanh nghiệp tư nhân (Cấp Tỉnh/TP)', kind: 'enterprise' },
+  { code: '758', name: 'Doanh nghiệp tư nhân (Cấp Huyện)', kind: 'enterprise' },
+  { code: '858', name: 'Doanh nghiệp tư nhân (Cấp Cơ sở)', kind: 'enterprise' },
+  { code: '160', name: 'Khối cơ quan hành chính, sự nghiệp (Cấp Trung ương)', kind: 'other' },
+  { code: '560', name: 'Khối cơ quan hành chính, sự nghiệp (Cấp Tỉnh/TP)', kind: 'other' },
+  { code: '760', name: 'Khối cơ quan hành chính, sự nghiệp (Cấp Huyện)', kind: 'other' },
+];
+
+const DEFAULT_NDKT_CODES = [
+  // 1700 — Thuế GTGT
+  { code: '1701', name: 'Thuế giá trị gia tăng hàng sản xuất, kinh doanh trong nước (gồm cả dịch vụ trong lĩnh vực dầu khí)', group: '1700', family: 'GTGT', popular: true },
+  { code: '1702', name: 'Thuế giá trị gia tăng hàng nhập khẩu', group: '1700', family: 'GTGT', popular: false },
+  { code: '1704', name: 'Thuế giá trị gia tăng từ hoạt động thăm dò, khai thác dầu khí', group: '1700', family: 'GTGT', popular: false },
+  { code: '1705', name: 'Thuế giá trị gia tăng từ hoạt động xổ số kiến thiết', group: '1700', family: 'GTGT', popular: false },
+
+  // 1050 — Thuế TNDN
+  { code: '1052', name: 'Thuế thu nhập doanh nghiệp của các đơn vị không hạch toán toàn ngành', group: '1050', family: 'TNDN', popular: true },
+  { code: '1053', name: 'Thuế thu nhập doanh nghiệp của các đơn vị hạch toán toàn ngành', group: '1050', family: 'TNDN', popular: false },
+  { code: '1054', name: 'Thuế thu nhập doanh nghiệp từ hoạt động xổ số kiến thiết', group: '1050', family: 'TNDN', popular: false },
+  { code: '1056', name: 'Thuế thu nhập doanh nghiệp từ hoạt động thăm dò, khai thác dầu khí', group: '1050', family: 'TNDN', popular: false },
+  { code: '1057', name: 'Thuế thu nhập doanh nghiệp từ chuyển nhượng bất động sản', group: '1050', family: 'TNDN', popular: false },
+
+  // 1000 — Thuế TNCN
+  { code: '1001', name: 'Thuế thu nhập từ tiền lương, tiền công', group: '1000', family: 'TNCN', popular: true },
+  { code: '1003', name: 'Thuế thu nhập từ hoạt động sản xuất, kinh doanh của cá nhân', group: '1000', family: 'TNCN', popular: true },
+  { code: '1004', name: 'Thuế thu nhập từ đầu tư vốn của cá nhân', group: '1000', family: 'TNCN', popular: true },
+  { code: '1005', name: 'Thuế thu nhập từ chuyển nhượng vốn', group: '1000', family: 'TNCN', popular: false },
+  { code: '1006', name: 'Thuế thu nhập từ chuyển nhượng bất động sản', group: '1000', family: 'TNCN', popular: false },
+  { code: '1007', name: 'Thuế thu nhập từ trúng thưởng', group: '1000', family: 'TNCN', popular: false },
+  { code: '1008', name: 'Thuế thu nhập từ bản quyền, nhượng quyền thương mại', group: '1000', family: 'TNCN', popular: false },
+  { code: '1014', name: 'Thuế thu nhập từ nhận thừa kế, quà tặng', group: '1000', family: 'TNCN', popular: false },
+  { code: '1049', name: 'Thuế thu nhập cá nhân khác', group: '1000', family: 'TNCN', popular: false },
+
+  // 2850 — Lệ phí Môn bài
+  { code: '2862', name: 'Lệ phí môn bài mức (bậc) 1 - Tổ chức vốn điều lệ trên 10 tỷ đồng', group: '2850', family: 'MON_BAI', popular: true },
+  { code: '2863', name: 'Lệ phí môn bài mức (bậc) 2 - Tổ chức vốn điều lệ từ 10 tỷ đồng trở xuống', group: '2850', family: 'MON_BAI', popular: true },
+  { code: '2864', name: 'Lệ phí môn bài mức (bậc) 3 - Chi nhánh, VPĐD, địa điểm kinh doanh', group: '2850', family: 'MON_BAI', popular: true },
+  { code: '2865', name: 'Lệ phí môn bài hộ/cá nhân kinh doanh bậc 1', group: '2850', family: 'MON_BAI', popular: false },
+  { code: '2866', name: 'Lệ phí môn bài hộ/cá nhân kinh doanh bậc 2', group: '2850', family: 'MON_BAI', popular: false },
+  { code: '2867', name: 'Lệ phí môn bài hộ/cá nhân kinh doanh bậc 3', group: '2850', family: 'MON_BAI', popular: false },
+
+  // 1750 — Thuế TTĐB
+  { code: '1751', name: 'Thuế tiêu thụ đặc biệt hàng hóa sản xuất trong nước', group: '1750', family: 'TTDB', popular: false },
+  { code: '1752', name: 'Thuế tiêu thụ đặc biệt hàng hóa nhập khẩu', group: '1750', family: 'TTDB', popular: false },
+  { code: '1753', name: 'Thuế tiêu thụ đặc biệt dịch vụ', group: '1750', family: 'TTDB', popular: false },
+  { code: '1757', name: 'Thuế tiêu thụ đặc biệt hàng hóa, dịch vụ trong nước khác', group: '1750', family: 'TTDB', popular: false },
+
+  // 2000 — Thuế BVMT
+  { code: '2001', name: 'Thuế bảo vệ môi trường đối với xăng, dầu, mỡ nhờn', group: '2000', family: 'BVMT', popular: false },
+  { code: '2002', name: 'Thuế bảo vệ môi trường đối với than đá', group: '2000', family: 'BVMT', popular: false },
+  { code: '2003', name: 'Thuế bảo vệ môi trường đối với dung dịch HCFC', group: '2000', family: 'BVMT', popular: false },
+  { code: '2004', name: 'Thuế bảo vệ môi trường đối với túi ni lông thuộc diện chịu thuế', group: '2000', family: 'BVMT', popular: false },
+
+  // 1550 — Thuế tài nguyên
+  { code: '1551', name: 'Thuế tài nguyên khoáng sản kim loại', group: '1550', family: 'TAIN', popular: false },
+  { code: '1552', name: 'Thuế tài nguyên khoáng sản không kim loại', group: '1550', family: 'TAIN', popular: false },
+  { code: '1554', name: 'Thuế tài nguyên nước thiên nhiên', group: '1550', family: 'TAIN', popular: false },
+
+  // 4250 — Tiền phạt
+  { code: '4254', name: 'Phạt vi phạm hành chính trong lĩnh vực thuế', group: '4250', family: 'PHAT', popular: true },
+  { code: '4268', name: 'Phạt vi phạm hành chính khác do ngành thuế thực hiện', group: '4250', family: 'PHAT', popular: false },
+  { code: '4272', name: 'Phạt vi phạm hành chính về hóa đơn', group: '4250', family: 'PHAT', popular: false },
+
+  // 4900 — Tiền chậm nộp
+  { code: '4911', name: 'Tiền chậm nộp các khoản thu khác do ngành thuế quản lý', group: '4900', family: 'CHAM_NOP', popular: true },
+  { code: '4917', name: 'Tiền chậm nộp thuế thu nhập cá nhân', group: '4900', family: 'CHAM_NOP', subFamily: 'TNCN', popular: true },
+  { code: '4918', name: 'Tiền chậm nộp thuế thu nhập doanh nghiệp', group: '4900', family: 'CHAM_NOP', subFamily: 'TNDN', popular: true },
+  { code: '4927', name: 'Tiền chậm nộp thuế tiêu thụ đặc biệt', group: '4900', family: 'CHAM_NOP', subFamily: 'TTDB', popular: false },
+  { code: '4931', name: 'Tiền chậm nộp thuế giá trị gia tăng', group: '4900', family: 'CHAM_NOP', subFamily: 'GTGT', popular: true },
+  { code: '4944', name: 'Tiền chậm nộp các khoản khác (lệ phí môn bài, phí, lệ phí...)', group: '4900', family: 'CHAM_NOP', subFamily: 'MON_BAI', popular: true },
+];
+
+  __exports.SYNC_CORE_NDKT_GROUPS = SYNC_CORE_NDKT_GROUPS;
+  __exports.DEFAULT_CHAPTER_CODES = DEFAULT_CHAPTER_CODES;
+  __exports.DEFAULT_NDKT_CODES = DEFAULT_NDKT_CODES;
+  },
+
+  "features/tax-code-helper/catalog-store.js": function(__require, __exports) {
+const { STORAGE_KEYS, getValue, setValue } = __require("core/storage.js");
+const { DEFAULT_CHAPTER_CODES, DEFAULT_NDKT_CODES } = __require("features/tax-code-helper/catalog-data.js");
+
+function readCacheRaw() {
+  const raw = getValue(STORAGE_KEYS.TAX_CODES_CACHE, null);
+  if (!raw || typeof raw !== 'object') {
+    return {
+      schemaVersion: 1,
+      updatedAt: null,
+      ndkt: {},
+      lastChapterByMst: {},
+    };
+  }
+  return {
+    schemaVersion: 1,
+    updatedAt: raw.updatedAt || null,
+    ndkt: raw.ndkt && typeof raw.ndkt === 'object' ? { ...raw.ndkt } : {},
+    lastChapterByMst:
+      raw.lastChapterByMst && typeof raw.lastChapterByMst === 'object'
+        ? { ...raw.lastChapterByMst }
+        : {},
+  };
+}
+
+function saveCacheRaw(cache) {
+  setValue(STORAGE_KEYS.TAX_CODES_CACHE, {
+    schemaVersion: 1,
+    updatedAt: cache.updatedAt || new Date().toISOString(),
+    ndkt: cache.ndkt || {},
+    lastChapterByMst: cache.lastChapterByMst || {},
+  });
+}
+
+/**
+ * Gộp bộ danh mục Offline Baseline + Bộ nhớ đệm thu thập từ cổng Thuế (ưu tiên tên chính thức từ cổng Thuế).
+ */
+function getMergedCatalog() {
+  const cache = readCacheRaw();
+  const ndktMap = new Map();
+
+  for (const item of DEFAULT_NDKT_CODES) {
+    ndktMap.set(item.code, {
+      code: item.code,
+      name: item.name,
+      group: item.group || '',
+      family: item.family || '',
+      subFamily: item.subFamily || '',
+      popular: Boolean(item.popular),
+      fromPortal: false,
+    });
+  }
+
+  for (const [code, entry] of Object.entries(cache.ndkt || {})) {
+    if (!/^\d{4}$/.test(code) || !entry || !entry.name) continue;
+    const prev = ndktMap.get(code);
+    ndktMap.set(code, {
+      code,
+      name: String(entry.name).trim(),
+      group: entry.group || prev?.group || '',
+      family: prev?.family || '',
+      subFamily: prev?.subFamily || '',
+      popular: Boolean(prev?.popular),
+      fromPortal: true,
+    });
+  }
+
+  const chapterMap = new Map();
+  for (const ch of DEFAULT_CHAPTER_CODES) {
+    chapterMap.set(ch.code, { ...ch });
+  }
+
+  return {
+    ndktMap,
+    ndktList: Array.from(ndktMap.values()).sort((a, b) => {
+      if (a.popular !== b.popular) return a.popular ? -1 : 1;
+      return a.code.localeCompare(b.code);
+    }),
+    chapterMap,
+    chapterList: Array.from(chapterMap.values()),
+    portalSyncedCount: Object.keys(cache.ndkt || {}).length,
+    updatedAt: cache.updatedAt,
+  };
+}
+
+/**
+ * Lưu bổ sung các dòng Tiểu mục thu thập được từ popup `getNdkt` (Passive Capture hoặc Manual Sync).
+ */
+function mergePortalNdktEntries(entries = []) {
+  if (!Array.isArray(entries) || entries.length === 0) return 0;
+  const cache = readCacheRaw();
+  let addedOrUpdated = 0;
+
+  for (const item of entries) {
+    const code = String(item?.code || '').trim();
+    const name = String(item?.name || '').replace(/\s+/g, ' ').trim();
+    if (!/^\d{4}$/.test(code) || !name) continue;
+
+    const existing = cache.ndkt[code];
+    if (!existing || existing.name !== name || (item.group && existing.group !== item.group)) {
+      cache.ndkt[code] = {
+        name,
+        group: item.group || existing?.group || '',
+      };
+      addedOrUpdated += 1;
+    }
+  }
+
+  if (addedOrUpdated > 0) {
+    cache.updatedAt = new Date().toISOString();
+    saveCacheRaw(cache);
+  }
+  return addedOrUpdated;
+}
+
+function getRememberedChapterForMst(mst) {
+  const key = String(mst || '').trim().toUpperCase();
+  if (!key) return '';
+  const cache = readCacheRaw();
+  return String(cache.lastChapterByMst[key] || '').trim();
+}
+
+function rememberChapterForMst(mst, chapterCode) {
+  const key = String(mst || '').trim().toUpperCase();
+  const code = String(chapterCode || '').trim();
+  if (!key || !/^\d{3}$/.test(code)) return;
+  const cache = readCacheRaw();
+  if (cache.lastChapterByMst[key] === code) return;
+  cache.lastChapterByMst[key] = code;
+  saveCacheRaw(cache);
+}
+
+  __exports.getMergedCatalog = getMergedCatalog;
+  __exports.mergePortalNdktEntries = mergePortalNdktEntries;
+  __exports.getRememberedChapterForMst = getRememberedChapterForMst;
+  __exports.rememberChapterForMst = rememberChapterForMst;
+  },
+
+  "features/tax-code-helper/validator.js": function(__require, __exports) {
+const { normalizeVietnamese } = __require("adapters/etax-adapter.js");
+
+const FAMILY_LABELS = {
+  GTGT: 'Thuế GTGT',
+  TNDN: 'Thuế TNDN',
+  TNCN: 'Thuế TNCN',
+  MON_BAI: 'Lệ phí môn bài',
+  TTDB: 'Thuế TTĐB',
+  BVMT: 'Thuế BVMT',
+  TAIN: 'Thuế tài nguyên',
+  PHAT: 'Tiền phạt vi phạm',
+  CHAM_NOP: 'Tiền chậm nộp',
+};
+
+const INDIVIDUAL_CHAPTERS = new Set(['157', '557', '757', '857']);
+
+function inferTaxFamilyFromCode(code) {
+  const s = String(code || '').trim();
+  if (!/^\d{4}$/.test(s)) return '';
+  const num = Number(s);
+  if (num >= 1700 && num <= 1749) return 'GTGT';
+  if (num >= 1050 && num <= 1099) return 'TNDN';
+  if (num >= 1000 && num <= 1049) return 'TNCN';
+  if (num >= 2850 && num <= 2899) return 'MON_BAI';
+  if (num >= 1750 && num <= 1799) return 'TTDB';
+  if (num >= 2000 && num <= 2049) return 'BVMT';
+  if (num >= 1550 && num <= 1599) return 'TAIN';
+  if (num >= 4250 && num <= 4299) return 'PHAT';
+  if (num >= 4900 && num <= 4949) return 'CHAM_NOP';
+  return '';
+}
+
+/**
+ * Suy luận nhóm thuế từ văn bản (Nội dung khoản nộp, Tên tờ khai, Ghi chú).
+ * Ưu tiên nhận diện "chậm nộp" / "tiền phạt" trước để KHÔNG báo đỏ oan kiểu "Chậm nộp thuế GTGT" dùng mã 4931!
+ */
+function inferTaxFamilyFromText(rawText) {
+  const t = normalizeVietnamese(rawText);
+  if (!t) return '';
+
+  // 1. Tiền chậm nộp (kiểm tra trước tên thuế gốc)
+  if (t.includes('cham nop') || t.includes('tien cham nop') || t.includes('tcn ')) {
+    return 'CHAM_NOP';
+  }
+  // 2. Tiền phạt
+  if (
+    t.includes('tien phat') ||
+    t.includes('phat vi pham') ||
+    t.includes('phat hanh chinh') ||
+    /\bphat\b/.test(t)
+  ) {
+    return 'PHAT';
+  }
+  // 3. Các sắc thuế chính
+  if (t.includes('gtgt') || t.includes('gia tri gia tang') || /\bvat\b/.test(t)) return 'GTGT';
+  if (t.includes('tndn') || t.includes('thu nhap doanh nghiep')) return 'TNDN';
+  if (
+    t.includes('tncn') ||
+    t.includes('thu nhap ca nhan') ||
+    t.includes('tien luong') ||
+    t.includes('tien cong')
+  ) {
+    return 'TNCN';
+  }
+  if (t.includes('mon bai') || t.includes('lpmb') || t.includes('mbai')) return 'MON_BAI';
+  if (t.includes('ttdb') || t.includes('tieu thu dac biet')) return 'TTDB';
+  if (t.includes('bvmt') || t.includes('bao ve moi truong')) return 'BVMT';
+  if (t.includes('tai nguyen') || /\btain\b/.test(t)) return 'TAIN';
+  return '';
+}
+
+function getMeaningfulTokens(text) {
+  const stop = new Set(['thue', 'cua', 'cac', 'cho', 'voi', 'trong', 'theo', 'tu', 'va', 'khac', 'nop', 'khoan']);
+  return normalizeVietnamese(text)
+    .split(/[^a-z0-9]+/)
+    .filter((w) => w.length >= 2 && !stop.has(w));
+}
+
+function hasTextOverlap(a, b) {
+  const ta = getMeaningfulTokens(a);
+  const tb = new Set(getMeaningfulTokens(b));
+  if (ta.length === 0 || tb.size === 0) return true;
+  let hits = 0;
+  for (const tok of ta) {
+    if (tb.has(tok)) hits += 1;
+  }
+  return hits >= 1;
+}
+
+/**
+ * Đối soát ô Mã Tiểu mục (`ma_tieumuc_{i}`) với `noi_dung_{i}`, tên tờ khai (`ma_tkhai_{i}`) và `ghichu_{i}`.
+ * Trả về: { status: 'empty' | 'green' | 'yellow' | 'red', summary, detail }
+ */
+function validateNdktRow({
+  maTieuMuc = '',
+  noiDung = '',
+  maTkhaiText = '',
+  ghiChu = '',
+  catalog,
+} = {}) {
+  const code = String(maTieuMuc || '').trim();
+  const content = String(noiDung || '').trim();
+  const decl = String(maTkhaiText || '').trim();
+  const note = String(ghiChu || '').trim();
+
+  if (!code) {
+    return {
+      status: 'empty',
+      summary: 'Chưa chọn Mã NDKT (Tiểu mục)',
+      detail: 'Bấm TM để chọn nhanh hoặc bấm kính lúp tra cứu gốc.',
+    };
+  }
+
+  if (!/^\d{4}$/.test(code)) {
+    return {
+      status: 'red',
+      summary: `Mã NDKT "${code}" sai định dạng`,
+      detail: 'Mã tiểu mục (NDKT) hợp lệ gồm đúng 4 chữ số (VD: 1701, 1052, 1001, 2862).',
+    };
+  }
+
+  const entry = catalog?.ndktMap?.get(code) || null;
+  const codeFamily = entry?.family || inferTaxFamilyFromCode(code);
+  const codeDesc = entry ? `${code} — ${entry.name}` : `Mã ${code}`;
+
+  // Kiểm tra 1: So khớp giữa Mã NDKT và ô "Nội dung các khoản nộp NSNN"
+  if (content) {
+    const contentFamily = inferTaxFamilyFromText(content);
+    if (codeFamily && contentFamily && codeFamily !== contentFamily) {
+      // Ngoại lệ: chậm nộp & phạt đôi khi đi chung câu chữ
+      const bothPenalty =
+        (codeFamily === 'PHAT' && contentFamily === 'CHAM_NOP') ||
+        (codeFamily === 'CHAM_NOP' && contentFamily === 'PHAT');
+      if (!bothPenalty) {
+        return {
+          status: 'red',
+          summary: `Lệch Nội dung khoản nộp vs Mã ${code}`,
+          detail: `Nội dung đang là "${content}" (${FAMILY_LABELS[contentFamily] || contentFamily}), nhưng mã ${codeDesc} thuộc ${FAMILY_LABELS[codeFamily] || codeFamily}.`,
+        };
+      }
+    }
+    if (entry && !hasTextOverlap(content, entry.name)) {
+      return {
+        status: 'red',
+        summary: `Nội dung không khớp tên chuẩn của mã ${code}`,
+        detail: `Ô nội dung ghi "${content}" nhưng mã ${code} là "${entry.name}". Hãy kiểm tra lại trước khi nộp!`,
+      };
+    }
+  }
+
+  // Kiểm tra 2: So khớp chéo với Tờ khai đã chọn (`ma_tkhai`) & Ghi chú chuyển tiền (`ghi_chu`)
+  const contextSources = [
+    { label: 'Tờ khai đã chọn', text: decl },
+    { label: 'Ghi chú', text: note },
+  ];
+
+  for (const src of contextSources) {
+    if (!src.text) continue;
+    const ctxFamily = inferTaxFamilyFromText(src.text);
+    if (!ctxFamily || !codeFamily) continue;
+
+    // Nếu ghi chú nói "chậm nộp thuế GTGT" (ctxFamily=CHAM_NOP) và code là 4931 (CHAM_NOP) → kiểm tra thêm subFamily!
+    if (ctxFamily === 'CHAM_NOP' && codeFamily === 'CHAM_NOP') {
+      const normSrc = normalizeVietnamese(src.text);
+      if (entry?.subFamily === 'GTGT' && (normSrc.includes('tndn') || normSrc.includes('tncn'))) {
+        return {
+          status: 'red',
+          summary: `Lệch sắc thuế Tiền chậm nộp (${code})`,
+          detail: `${src.label} ghi "${src.text}", nhưng mã ${codeDesc} là chậm nộp GTGT!`,
+        };
+      }
+      if (entry?.subFamily === 'TNDN' && (normSrc.includes('gtgt') || normSrc.includes('tncn'))) {
+        return {
+          status: 'red',
+          summary: `Lệch sắc thuế Tiền chậm nộp (${code})`,
+          detail: `${src.label} ghi "${src.text}", nhưng mã ${codeDesc} là chậm nộp TNDN!`,
+        };
+      }
+      if (entry?.subFamily === 'TNCN' && (normSrc.includes('gtgt') || normSrc.includes('tndn'))) {
+        return {
+          status: 'red',
+          summary: `Lệch sắc thuế Tiền chậm nộp (${code})`,
+          detail: `${src.label} ghi "${src.text}", nhưng mã ${codeDesc} là chậm nộp TNCN!`,
+        };
+      }
+      continue;
+    }
+
+    if (ctxFamily !== codeFamily) {
+      // Nếu kế toán chọn tờ khai 01/GTGT để nộp tiền chậm nộp GTGT (4931) → hợp lệ, không báo đỏ oan!
+      if (src.label === 'Tờ khai đã chọn' && (codeFamily === 'CHAM_NOP' || codeFamily === 'PHAT')) {
+        continue;
+      }
+      return {
+        status: 'red',
+        summary: `Cảnh báo lệch với ${src.label}!`,
+        detail: `${src.label} ("${src.text}") thuộc ${FAMILY_LABELS[ctxFamily] || ctxFamily}, nhưng Mã NDKT ${codeDesc} lại thuộc ${FAMILY_LABELS[codeFamily] || codeFamily}.`,
+      };
+    }
+  }
+
+  // Kiểm tra 3: Mã 4 số hợp lệ nhưng chưa nằm trong từ điển/cache cục bộ
+  if (!entry) {
+    return {
+      status: 'yellow',
+      summary: `Mã ${code} chưa có trong bộ nhớ đệm cục bộ`,
+      detail: 'Mã đúng 4 số nhưng chưa có tên chuẩn trong cache. Mở popup tra cứu gốc để tự học hoặc bấm Đồng bộ.',
+    };
+  }
+
+  return {
+    status: 'green',
+    summary: `Khớp: ${codeDesc}`,
+    detail: content ? `Khớp với nội dung nộp "${content}".` : `Ý nghĩa: ${entry.name}`,
+  };
+}
+
+/**
+ * Đối soát ô Mã Chương (`ma_chuong_{i}`):
+ * - So với Mã Chương gốc cổng thuế tự điền ban đầu + Mã Chương chuẩn đã nhớ của MST + danh mục Chương hợp lệ.
+ * - Xử lý đúng ngoại lệ TNCN (cổng thuế tự chuyển 557/757/857 khi nộp 1001..1049), nhưng báo ĐỎ ngay
+ *   nếu lệch sang Chương cá nhân khi nộp thuế DN (GTGT/TNDN/Môn bài) hoặc sửa tay sai mã!
+ */
+function validateChapterRow({
+  maChuong = '',
+  initialPortalChapter = '',
+  rememberedMstChapter = '',
+  maTieuMuc = '',
+  catalog,
+} = {}) {
+  const code = String(maChuong || '').trim();
+  const initial = String(initialPortalChapter || '').trim();
+  const remembered = String(rememberedMstChapter || '').trim();
+  const ndktFamily = inferTaxFamilyFromCode(maTieuMuc);
+
+  if (!code) {
+    return {
+      status: 'red',
+      summary: 'Chưa có Mã Chương',
+      detail: 'Vui lòng điền Mã Chương 3 chữ số (VD: 554, 754, 854).',
+    };
+  }
+
+  if (!/^\d{3}$/.test(code)) {
+    return {
+      status: 'red',
+      summary: `Mã Chương "${code}" sai định dạng`,
+      detail: 'Mã Chương hợp lệ gồm đúng 3 chữ số (VD: 554, 754, 854).',
+    };
+  }
+
+  const entry = catalog?.chapterMap?.get(code) || null;
+  const codeMeaning = entry ? `${code} — ${entry.name}` : `Mã Chương ${code}`;
+  const isIndividualChapter = INDIVIDUAL_CHAPTERS.has(code) || entry?.kind === 'individual';
+  const baseline = initial || remembered;
+
+  // Cảnh báo đặc biệt: Đang nộp thuế Doanh nghiệp (GTGT / TNDN / Môn bài) nhưng Chương lại là Chương Cá nhân (557/757/857)
+  if (isIndividualChapter && ['GTGT', 'TNDN', 'MON_BAI'].includes(ndktFamily)) {
+    const expectedHint = baseline && !INDIVIDUAL_CHAPTERS.has(baseline) ? ` (mã DN gốc: ${baseline})` : '';
+    return {
+      status: 'red',
+      summary: `Lệch Chương Cá nhân (${code}) khi nộp ${FAMILY_LABELS[ndktFamily]}`,
+      detail: `Mã ${codeMeaning} dành cho cá nhân/hộ KD, có thể bị sai khi nộp ${FAMILY_LABELS[ndktFamily]} doanh nghiệp${expectedHint}!`,
+    };
+  }
+
+  // Ngoại lệ hợp lệ: Nộp TNCN (1001..1049 hoặc chậm nộp TNCN 4917) và cổng thuế chuyển sang Chương cá nhân (557/757/857)
+  const isTncnTax = ndktFamily === 'TNCN' || String(maTieuMuc || '').trim() === '4917';
+  if (isIndividualChapter && isTncnTax) {
+    return {
+      status: 'green',
+      summary: `Khớp (TNCN): ${codeMeaning}`,
+      detail: initial && initial !== code
+        ? `Hệ thống/kế toán dùng Chương cá nhân ${code} phù hợp với khoản nộp TNCN (Mã Chương DN gốc: ${initial}).`
+        : `Phù hợp với khoản nộp thuế TNCN.`,
+    };
+  }
+
+  // Nếu bị chỉnh tay lệch khỏi Mã Chương gốc cổng thuế (và cũng khác mã đã nhớ của MST)
+  if (initial && code !== initial && (!remembered || code !== remembered)) {
+    const initEntry = catalog?.chapterMap?.get(initial);
+    const initDesc = initEntry ? `${initial} (${initEntry.name})` : initial;
+    return {
+      status: 'red',
+      summary: `Mã Chương ${code} lệch mã gốc cổng thuế (${initial})`,
+      detail: `Đang điền ${codeMeaning}, khác với mã gốc cổng thuế tự điền ban đầu là ${initDesc}. Kiểm tra kỹ tránh nộp nhầm Chương!`,
+    };
+  }
+
+  if (!entry) {
+    return {
+      status: 'yellow',
+      summary: `Mã Chương ${code} không nằm trong nhóm DN phổ biến`,
+      detail: initial === code
+        ? 'Trùng với mã cổng thuế tự điền sẵn, nhưng chưa có giải thích chi tiết trong danh mục cơ bản.'
+        : 'Hãy đối chiếu lại Mã Chương trên thông báo đăng ký thuế của doanh nghiệp.',
+    };
+  }
+
+  return {
+    status: 'green',
+    summary: `Khớp: ${codeMeaning}`,
+    detail: initial === code ? 'Khớp với Mã Chương mặc định cổng thuế tự điền.' : `Khớp với Mã Chương đã ghi nhớ của MST.`,
+  };
+}
+
+  __exports.inferTaxFamilyFromCode = inferTaxFamilyFromCode;
+  __exports.inferTaxFamilyFromText = inferTaxFamilyFromText;
+  __exports.validateNdktRow = validateNdktRow;
+  __exports.validateChapterRow = validateChapterRow;
+  },
+
+  "features/tax-code-helper/index.js": function(__require, __exports) {
+const { isEtaxOrigin, isGntFormPage, findGntDetailRows, isNdktPopupPage, parseNdktResultTable, setNativeInputValue, normalizeVietnamese } = __require("adapters/etax-adapter.js");
+const { createDomWatcher } = __require("core/dom-observer.js");
+const { createShadowMount } = __require("ui/shadow-host.js");
+const { getActiveCompanyContext } = __require("features/company-bar/note-store.js");
+const { SYNC_CORE_NDKT_GROUPS } = __require("features/tax-code-helper/catalog-data.js");
+const { getMergedCatalog, mergePortalNdktEntries, getRememberedChapterForMst, rememberChapterForMst } = __require("features/tax-code-helper/catalog-store.js");
+const { validateNdktRow, validateChapterRow } = __require("features/tax-code-helper/validator.js");
+
+const HELPER_INLINE_CSS = `
+.eh-tc-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  vertical-align: middle;
+  margin-left: 3px;
+}
+.eh-tc-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  border: 1px solid rgba(15, 23, 42, 0.18);
+  cursor: pointer;
+  padding: 0;
+  flex-shrink: 0;
+  transition: transform 0.12s;
+}
+.eh-tc-dot:hover { transform: scale(1.2); }
+.eh-tc-dot.green { background: #16a34a; box-shadow: 0 0 0 2px rgba(22, 163, 74, 0.22); }
+.eh-tc-dot.red { background: #dc2626; box-shadow: 0 0 0 2px rgba(220, 38, 38, 0.28); }
+.eh-tc-dot.yellow { background: #eab308; box-shadow: 0 0 0 2px rgba(234, 179, 8, 0.24); }
+.eh-tc-dot.empty { background: #cbd5e1; }
+.eh-tc-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1px 4px;
+  border-radius: 4px;
+  border: 1px solid #93c5fd;
+  background: #eff6ff;
+  color: #006FBC;
+  font-size: 10.5px;
+  font-weight: 700;
+  cursor: pointer;
+  line-height: 1.3;
+}
+.eh-tc-btn:hover {
+  background: #006FBC;
+  color: #ffffff;
+  border-color: #006FBC;
+}
+`;
+
+const PICKER_POP_CSS = `
+.eh-tc-pop {
+  position: fixed;
+  z-index: 2147483640;
+  width: min(440px, calc(100vw - 24px));
+  max-height: min(440px, calc(100vh - 24px));
+  display: flex;
+  flex-direction: column;
+  background: #ffffff;
+  border: 1.5px solid #006FBC;
+  border-radius: 10px;
+  box-shadow: 0 18px 40px rgba(15, 23, 42, 0.26);
+  overflow: hidden;
+}
+.eh-tc-pop-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 12px;
+  background: #f0f8ff;
+  border-bottom: 1px solid #bae0ff;
+}
+.eh-tc-pop-title {
+  font-size: 12.5px;
+  font-weight: 700;
+  color: #006FBC;
+}
+.eh-tc-status-box {
+  padding: 7px 11px;
+  font-size: 12px;
+  line-height: 1.4;
+  border-bottom: 1px solid #e2e8f0;
+}
+.eh-tc-status-box.green { background: #f0fdf4; color: #166534; }
+.eh-tc-status-box.red { background: #fef2f2; color: #991b1b; }
+.eh-tc-status-box.yellow { background: #fffbeb; color: #92400e; }
+.eh-tc-status-box.empty { background: #f8fafc; color: #475569; }
+.eh-tc-search-bar {
+  padding: 8px 10px;
+  border-bottom: 1px solid #e2e8f0;
+}
+.eh-tc-list {
+  flex: 1;
+  overflow-y: auto;
+  max-height: 250px;
+}
+.eh-tc-item {
+  padding: 7px 11px;
+  border-bottom: 1px solid #f1f5f9;
+  cursor: pointer;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+.eh-tc-item:hover { background: #eff6ff; }
+.eh-tc-code {
+  font-weight: 700;
+  color: #006FBC;
+  font-variant-numeric: tabular-nums;
+  min-width: 40px;
+  flex-shrink: 0;
+}
+.eh-tc-name {
+  font-size: 12px;
+  color: #1e293b;
+  line-height: 1.35;
+}
+.eh-tc-tag {
+  display: inline-block;
+  margin-left: 5px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 700;
+  background: #dbeafe;
+  color: #1d4ed8;
+}
+.eh-tc-tag-mst {
+  background: #fef3c7;
+  color: #92400e;
+}
+.eh-tc-foot {
+  padding: 7px 10px;
+  background: #f8fafc;
+  border-top: 1px solid #e2e8f0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11px;
+  color: #64748b;
+}
+`;
+
+function esc(str) {
+  return String(str ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function getPageWindow() {
+  try {
+    return typeof unsafeWindow !== 'undefined' && unsafeWindow ? unsafeWindow : window;
+  } catch {
+    return window;
+  }
+}
+
+function getSelectedOptionText(selectEl) {
+  if (!selectEl || selectEl.selectedIndex < 0) return '';
+  const opt = selectEl.options[selectEl.selectedIndex];
+  if (!opt || !opt.value) return '';
+  return (opt.textContent || '').trim();
+}
+
+function createTaxCodeHelperFeature() {
+  let active = false;
+  let watcher = null;
+  let popupObserver = null;
+  let focusHandler = null;
+  let outsideClickHandler = null;
+
+  // Theo dõi từng dòng đã gắn theo `tr`
+  const rowBindings = new Map();
+  let activePickerHost = null;
+  let activePickerCleanup = null;
+  let popupBannerHost = null;
+
+  const closePicker = () => {
+    if (activePickerCleanup) {
+      activePickerCleanup();
+      activePickerCleanup = null;
+    }
+    if (activePickerHost) {
+      activePickerHost.remove();
+      activePickerHost = null;
+    }
+  };
+
+  const getCurrentMst = () => getActiveCompanyContext().mst || '';
+
+  const applyNdktSelection = (row, item) => {
+    if (row.maTieuMucInput) {
+      setNativeInputValue(row.maTieuMucInput, item.code, {
+        triggerInput: true,
+        triggerChange: true,
+        triggerBlur: false,
+      });
+    }
+    if (row.noiDungInput) {
+      setNativeInputValue(row.noiDungInput, item.name, {
+        triggerInput: true,
+        triggerChange: true,
+        triggerBlur: false,
+      });
+    }
+    // Mở khóa ô số tiền nếu vẫn đang bị readonly (giữ nguyên logic gốc khi đã chọn VND)
+    if (row.soTienInput && row.soTienInput.hasAttribute('readonly')) {
+      row.soTienInput.removeAttribute('readonly');
+    }
+    // Cập nhật bộ đếm ký tự điện chuyển tiền CITAD .../210 của cổng thuế
+    try {
+      const pw = getPageWindow();
+      if (typeof pw.countCitad === 'function') {
+        pw.countCitad();
+      }
+    } catch {
+      // ignore page callback error
+    }
+  };
+
+  const applyChapterSelection = (row, item) => {
+    if (!row.maChuongInput) return;
+    setNativeInputValue(row.maChuongInput, item.code, {
+      triggerInput: true,
+      triggerChange: true,
+      triggerBlur: true,
+    });
+    const mst = getCurrentMst();
+    if (mst) {
+      rememberChapterForMst(mst, item.code);
+    }
+  };
+
+  const openPickerPopover = ({ kind, row, anchorEl, initialPortalChapter, onUpdated }) => {
+    closePicker();
+
+    const catalog = getMergedCatalog();
+    const mst = getCurrentMst();
+    const rememberedChapter = getRememberedChapterForMst(mst);
+
+    const validation =
+      kind === 'ndkt'
+        ? validateNdktRow({
+            maTieuMuc: row.maTieuMucInput?.value || '',
+            noiDung: row.noiDungInput?.value || '',
+            maTkhaiText: getSelectedOptionText(row.maTkhaiSelect),
+            ghiChu: row.ghiChuInput?.value || '',
+            catalog,
+          })
+        : validateChapterRow({
+            maChuong: row.maChuongInput?.value || '',
+            initialPortalChapter,
+            rememberedMstChapter: rememberedChapter,
+            maTieuMuc: row.maTieuMucInput?.value || '',
+            catalog,
+          });
+
+    const { host, root, cleanup } = createShadowMount('div', PICKER_POP_CSS, {
+      'data-etax-role': 'tax-code-picker',
+    });
+    activePickerHost = host;
+    activePickerCleanup = cleanup;
+    document.body.appendChild(host);
+
+    let searchQuery = '';
+
+    const positionPop = (popEl) => {
+      const rect = anchorEl.getBoundingClientRect();
+      const popW = Math.min(440, window.innerWidth - 24);
+      const popH = Math.min(420, window.innerHeight - 24);
+      let left = rect.left;
+      if (left + popW > window.innerWidth - 12) {
+        left = Math.max(12, window.innerWidth - popW - 12);
+      }
+      let top = rect.bottom + 6;
+      if (top + popH > window.innerHeight - 12) {
+        top = Math.max(12, rect.top - popH - 6);
+      }
+      popEl.style.left = `${Math.round(left)}px`;
+      popEl.style.top = `${Math.round(top)}px`;
+    };
+
+    const render = () => {
+      const q = normalizeVietnamese(searchQuery);
+      let items = kind === 'ndkt' ? catalog.ndktList : catalog.chapterList;
+
+      if (kind === 'chapter' && (rememberedChapter || initialPortalChapter)) {
+        items = [...items].sort((a, b) => {
+          const score = (c) =>
+            c.code === rememberedChapter ? 3 : c.code === initialPortalChapter ? 2 : 0;
+          return score(b) - score(a);
+        });
+      }
+
+      const filtered = q
+        ? items.filter(
+            (it) =>
+              it.code.includes(q) || normalizeVietnamese(it.name).includes(q),
+          )
+        : items;
+
+      const title =
+        kind === 'ndkt'
+          ? '🔎 Trợ lý Mã Tiểu mục (NDKT) — Chọn nhanh & Đối soát'
+          : '🔎 Trợ lý Mã Chương — Chọn nhanh & Đối soát';
+
+      root.innerHTML = `
+        <div class="eh-tc-pop" id="eh-tc-pop">
+          <div class="eh-tc-pop-head">
+            <div class="eh-tc-pop-title">${title}</div>
+            <button type="button" class="eh-btn eh-btn-sm" id="eh-tc-close">Đóng</button>
+          </div>
+          <div class="eh-tc-status-box ${validation.status}">
+            <strong>${
+              validation.status === 'green'
+                ? '🟢'
+                : validation.status === 'red'
+                  ? '🔴'
+                  : validation.status === 'yellow'
+                    ? '🟡'
+                    : '⚪'
+            } ${esc(validation.summary)}</strong><br/>
+            <span>${esc(validation.detail)}</span>
+          </div>
+          <div class="eh-tc-search-bar">
+            <input type="text" class="eh-input" id="eh-tc-search" value="${esc(searchQuery)}"
+              placeholder="${
+                kind === 'ndkt'
+                  ? 'Gõ mã (1701, 1052, 2862) hoặc tên không dấu (gtgt, mon bai, cham nop)...'
+                  : 'Gõ mã Chương (854, 754, 554, 557) hoặc cấp quản lý...'
+              }" autocomplete="off"/>
+          </div>
+          <div class="eh-tc-list">
+            ${
+              filtered.length === 0
+                ? '<div style="padding:14px; text-align:center;" class="eh-muted">Không tìm thấy mã phù hợp.</div>'
+                : filtered
+                    .slice(0, 80)
+                    .map((it) => {
+                      const badges = [];
+                      if (kind === 'chapter' && it.code === rememberedChapter) {
+                        badges.push('<span class="eh-tc-tag eh-tc-tag-mst">MST hay dùng</span>');
+                      }
+                      if (kind === 'chapter' && it.code === initialPortalChapter) {
+                        badges.push('<span class="eh-tc-tag">Mặc định cổng thuế</span>');
+                      }
+                      if (kind === 'ndkt' && it.fromPortal) {
+                        badges.push('<span class="eh-tc-tag">Đồng bộ Thuế</span>');
+                      }
+                      return `
+                        <div class="eh-tc-item" data-code="${esc(it.code)}">
+                          <div class="eh-tc-code">${esc(it.code)}</div>
+                          <div class="eh-tc-name">${esc(it.name)}${badges.join('')}</div>
+                        </div>
+                      `;
+                    })
+                    .join('')
+            }
+          </div>
+          <div class="eh-tc-foot">
+            <span>${
+              kind === 'ndkt'
+                ? `Danh mục: ${catalog.ndktList.length} mã (${catalog.portalSyncedCount} đã đồng bộ từ Thuế)`
+                : `Danh mục: ${catalog.chapterList.length} Mã Chương phổ biến`
+            }</span>
+            ${
+              kind === 'ndkt' && row.tieuMucImg
+                ? '<button type="button" class="eh-btn eh-btn-sm" id="eh-tc-open-native">🔄 Mở tra cứu Thuế để đồng bộ</button>'
+                : ''
+            }
+          </div>
+        </div>
+      `;
+
+      const popEl = root.querySelector('#eh-tc-pop');
+      if (popEl) positionPop(popEl);
+
+      root.querySelector('#eh-tc-close')?.addEventListener('click', closePicker);
+      root.querySelector('#eh-tc-open-native')?.addEventListener('click', () => {
+        closePicker();
+        row.tieuMucImg?.click();
+      });
+
+      const searchEl = root.querySelector('#eh-tc-search');
+      if (searchEl) {
+        searchEl.focus();
+        searchEl.setSelectionRange(searchQuery.length, searchQuery.length);
+        searchEl.addEventListener('input', (e) => {
+          searchQuery = e.target.value;
+          render();
+        });
+        searchEl.addEventListener('keydown', (e) => {
+          if (e.key === 'Escape') closePicker();
+        });
+      }
+
+      root.querySelectorAll('.eh-tc-item').forEach((el) => {
+        el.addEventListener('click', () => {
+          const pickedCode = el.dataset.code;
+          const picked =
+            kind === 'ndkt'
+              ? catalog.ndktMap.get(pickedCode)
+              : catalog.chapterMap.get(pickedCode);
+          if (picked) {
+            if (kind === 'ndkt') {
+              applyNdktSelection(row, picked);
+            } else {
+              applyChapterSelection(row, picked);
+            }
+            closePicker();
+            onUpdated();
+          }
+        });
+      });
+    };
+
+    render();
+  };
+
+  const attachRowHelper = (row) => {
+    if (rowBindings.has(row.tr)) return;
+
+    const initialPortalChapter = String(row.maChuongInput?.value || '').trim();
+    const mountedHosts = [];
+    const listeners = [];
+
+    const bindListener = (el, evt, fn) => {
+      if (!el) return;
+      el.addEventListener(evt, fn);
+      listeners.push(() => el.removeEventListener(evt, fn));
+    };
+
+    const createInlineMount = (targetInput, kind) => {
+      if (!targetInput || !targetInput.parentNode) return null;
+      const { host, root } = createShadowMount('span', HELPER_INLINE_CSS, {
+        'data-etax-role': `tax-code-${kind}-inline`,
+      });
+      host.style.display = 'inline-flex';
+      host.style.verticalAlign = 'middle';
+      targetInput.insertAdjacentElement('afterend', host);
+      mountedHosts.push(host);
+
+      root.innerHTML = `
+        <span class="eh-tc-inline">
+          <button type="button" class="eh-tc-dot empty" id="dot" title="Đang kiểm tra..."></button>
+          <button type="button" class="eh-tc-btn" id="pick" title="${
+            kind === 'ndkt' ? 'Chọn nhanh & Tra cứu Mã Tiểu mục' : 'Chọn nhanh & Tra cứu Mã Chương'
+          }">${kind === 'ndkt' ? 'TM' : 'MC'}</button>
+        </span>
+      `;
+
+      const dotBtn = root.querySelector('#dot');
+      const pickBtn = root.querySelector('#pick');
+      const onClick = (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        openPickerPopover({
+          kind,
+          row,
+          anchorEl: host,
+          initialPortalChapter,
+          onUpdated: revalidate,
+        });
+      };
+      dotBtn?.addEventListener('click', onClick);
+      pickBtn?.addEventListener('click', onClick);
+
+      return { dotBtn, pickBtn };
+    };
+
+    const ndktUi = createInlineMount(row.maTieuMucInput, 'ndkt');
+    const chapterUi = createInlineMount(row.maChuongInput, 'chapter');
+
+    const revalidate = () => {
+      const catalog = getMergedCatalog();
+      const rememberedChapter = getRememberedChapterForMst(getCurrentMst());
+
+      if (ndktUi?.dotBtn) {
+        const res = validateNdktRow({
+          maTieuMuc: row.maTieuMucInput?.value || '',
+          noiDung: row.noiDungInput?.value || '',
+          maTkhaiText: getSelectedOptionText(row.maTkhaiSelect),
+          ghiChu: row.ghiChuInput?.value || '',
+          catalog,
+        });
+        ndktUi.dotBtn.className = `eh-tc-dot ${res.status}`;
+        ndktUi.dotBtn.title = `${res.summary}\n${res.detail}`;
+      }
+
+      if (chapterUi?.dotBtn) {
+        const res = validateChapterRow({
+          maChuong: row.maChuongInput?.value || '',
+          initialPortalChapter,
+          rememberedMstChapter: rememberedChapter,
+          maTieuMuc: row.maTieuMucInput?.value || '',
+          catalog,
+        });
+        chapterUi.dotBtn.className = `eh-tc-dot ${res.status}`;
+        chapterUi.dotBtn.title = `${res.summary}\n${res.detail}`;
+      }
+    };
+
+    // Ghi nhận Mã Chương nếu kế toán nhập tay hợp lệ và rời ô
+    bindListener(row.maChuongInput, 'blur', () => {
+      const val = String(row.maChuongInput?.value || '').trim();
+      if (/^\d{3}$/.test(val) && getCurrentMst()) {
+        rememberChapterForMst(getCurrentMst(), val);
+      }
+      revalidate();
+    });
+
+    for (const el of [
+      row.maChuongInput,
+      row.maTieuMucInput,
+      row.noiDungInput,
+      row.ghiChuInput,
+    ]) {
+      bindListener(el, 'input', revalidate);
+      bindListener(el, 'change', revalidate);
+    }
+    bindListener(row.maTkhaiSelect, 'change', revalidate);
+
+    revalidate();
+
+    rowBindings.set(row.tr, {
+      revalidate,
+      destroy() {
+        for (const off of listeners) off();
+        for (const h of mountedHosts) h.remove();
+      },
+    });
+  };
+
+  const scanGntForm = () => {
+    if (!active || !isGntFormPage(document)) return;
+    const rows = findGntDetailRows(document);
+    const aliveTrs = new Set(rows.map((r) => r.tr));
+
+    for (const [tr, binding] of rowBindings.entries()) {
+      if (!aliveTrs.has(tr)) {
+        binding.destroy();
+        rowBindings.delete(tr);
+      }
+    }
+
+    for (const row of rows) {
+      if (!rowBindings.has(row.tr)) {
+        attachRowHelper(row);
+      } else {
+        rowBindings.get(row.tr).revalidate();
+      }
+    }
+  };
+
+  // ============================================================================
+  // CHẾ ĐỘ POPUP `getNdkt`: Passive Capture + Nút Đồng bộ an toàn 8 nhóm thuế DN
+  // ============================================================================
+
+  const setupNdktPopupMode = () => {
+    const cbo = document.querySelector('select#cboNdkt');
+    const searchBtn = document.querySelector('input#tracuu');
+    const resultTable = document.querySelector('table#tblResult');
+    if (!cbo || !resultTable) return;
+
+    let syncing = false;
+    let statusSpan = null;
+
+    const captureCurrentTable = () => {
+      const groupCode = cbo.value || '';
+      const entries = parseNdktResultTable(document, groupCode);
+      if (entries.length === 0) return 0;
+      mergePortalNdktEntries(entries);
+      if (statusSpan && !syncing) {
+        const merged = getMergedCatalog();
+        statusSpan.textContent = `✓ Tự lưu ${entries.length} tiểu mục (Tổng cache Thuế: ${merged.portalSyncedCount})`;
+      }
+      return entries.length;
+    };
+
+    // Chèn thanh nhỏ gọn ngay cạnh nút Tra cứu trong popup
+    if (searchBtn && !popupBannerHost) {
+      const { host, root } = createShadowMount('span', '', {
+        'data-etax-role': 'ndkt-popup-sync',
+      });
+      host.style.display = 'inline-flex';
+      host.style.marginLeft = '8px';
+      host.style.verticalAlign = 'middle';
+      searchBtn.insertAdjacentElement('afterend', host);
+      popupBannerHost = host;
+
+      root.innerHTML = `
+        <span style="display:inline-flex; align-items:center; gap:6px;">
+          <button type="button" class="eh-btn eh-btn-primary eh-btn-sm" id="eh-ndkt-sync"
+            title="Tuần tự đồng bộ 8 nhóm thuế doanh nghiệp cốt lõi vào bộ nhớ đệm cục bộ">
+            🔄 Đồng bộ 8 nhóm thuế DN
+          </button>
+          <span id="eh-ndkt-status" class="eh-muted" style="font-size:11.5px;"></span>
+        </span>
+      `;
+      statusSpan = root.querySelector('#eh-ndkt-status');
+      const syncBtn = root.querySelector('#eh-ndkt-sync');
+
+      const waitNextTableUpdate = (prevSignature, timeoutMs = 4000) =>
+        new Promise((resolve) => {
+          const started = Date.now();
+          const check = () => {
+            const sig = resultTable.textContent || '';
+            if (sig !== prevSignature && resultTable.querySelectorAll('tr').length > 1) {
+              resolve(true);
+              return;
+            }
+            if (Date.now() - started >= timeoutMs) {
+              resolve(false);
+              return;
+            }
+            setTimeout(check, 120);
+          };
+          setTimeout(check, 160);
+        });
+
+      syncBtn?.addEventListener('click', async () => {
+        if (syncing) return;
+        const pw = getPageWindow();
+        if (typeof pw.traCuuDanhMuc !== 'function') {
+          if (statusSpan) statusSpan.textContent = 'Không tìm thấy hàm traCuuDanhMuc() của trang.';
+          return;
+        }
+        syncing = true;
+        syncBtn.disabled = true;
+        let totalCaptured = 0;
+
+        for (let i = 0; i < SYNC_CORE_NDKT_GROUPS.length; i++) {
+          const groupCode = SYNC_CORE_NDKT_GROUPS[i];
+          const hasOpt = Array.from(cbo.options).some((o) => o.value === groupCode);
+          if (!hasOpt) continue;
+
+          if (statusSpan) {
+            statusSpan.textContent = `Đang đồng bộ nhóm ${groupCode} (${i + 1}/${SYNC_CORE_NDKT_GROUPS.length})...`;
+          }
+          const prevSig = resultTable.textContent || '';
+          cbo.value = groupCode;
+          cbo.dispatchEvent(new Event('change', { bubbles: true }));
+          try {
+            pw.traCuuDanhMuc();
+          } catch {
+            // ignore
+          }
+          await waitNextTableUpdate(prevSig, 3500);
+          const count = captureCurrentTable();
+          totalCaptured += count;
+          // Giãn cách lịch sự 350ms tránh gây tải máy chủ thuế
+          await new Promise((r) => setTimeout(r, 350));
+        }
+
+        const merged = getMergedCatalog();
+        if (statusSpan) {
+          statusSpan.textContent = `✅ Đồng bộ xong ${totalCaptured} dòng (Tổng cache: ${merged.portalSyncedCount} tiểu mục)!`;
+        }
+        syncing = false;
+        syncBtn.disabled = false;
+      });
+    }
+
+    // Passive Capture ban đầu + mỗi khi `#tblResult` cập nhật sau khi bấm Tra cứu
+    captureCurrentTable();
+    popupObserver = new MutationObserver(() => {
+      if (!syncing) captureCurrentTable();
+    });
+    popupObserver.observe(resultTable, { childList: true, subtree: true });
+  };
+
+  return {
+    start() {
+      if (!isEtaxOrigin(location.origin)) return;
+      active = true;
+
+      if (isNdktPopupPage(location, document)) {
+        setupNdktPopupMode();
+        return;
+      }
+
+      outsideClickHandler = (event) => {
+        if (!activePickerHost) return;
+        const path = typeof event.composedPath === 'function' ? event.composedPath() : [];
+        if (path.includes(activePickerHost) || activePickerHost.contains(event.target)) return;
+        closePicker();
+      };
+      document.addEventListener('pointerdown', outsideClickHandler, true);
+
+      // Khi popup tra cứu gốc `openWindow(i)` ghi xong dữ liệu vào `window.opener` và đóng lại,
+      // sự kiện focus quay lại iframe sẽ kích hoạt đối soát lại toàn bộ các chấm Xanh/Đỏ!
+      focusHandler = () => {
+        for (const binding of rowBindings.values()) {
+          binding.revalidate();
+        }
+      };
+      window.addEventListener('focus', focusHandler);
+
+      watcher = createDomWatcher(scanGntForm, { debounceMs: 200 });
+      watcher.start();
+    },
+
+    stop() {
+      active = false;
+      closePicker();
+      if (watcher) {
+        watcher.stop();
+        watcher = null;
+      }
+      if (popupObserver) {
+        popupObserver.disconnect();
+        popupObserver = null;
+      }
+      if (popupBannerHost) {
+        popupBannerHost.remove();
+        popupBannerHost = null;
+      }
+      if (focusHandler) {
+        window.removeEventListener('focus', focusHandler);
+        focusHandler = null;
+      }
+      if (outsideClickHandler) {
+        document.removeEventListener('pointerdown', outsideClickHandler, true);
+        outsideClickHandler = null;
+      }
+      for (const binding of rowBindings.values()) {
+        binding.destroy();
+      }
+      rowBindings.clear();
+    },
+  };
+}
+
+  __exports.createTaxCodeHelperFeature = createTaxCodeHelperFeature;
+  },
+
+  "features/quick-access/bookmark-store.js": function(__require, __exports) {
+const { STORAGE_KEYS, getValue, setValue } = __require("core/storage.js");
+const { normalizeVietnamese } = __require("adapters/etax-adapter.js");
+
+const STARTER_DECLARATION_PRESETS = [
+  { coreCode: '01/GTGT', label: '01/GTGT — Thuế GTGT khấu trừ', matchMode: 'core' },
+  { coreCode: '05/KK-TNCN', label: '05/KK-TNCN — Khấu trừ thuế TNCN', matchMode: 'core' },
+  { coreCode: '03/TNDN', label: '03/TNDN — Quyết toán thuế TNDN', matchMode: 'core' },
+  { coreCode: '05/QTT-TNCN', label: '05/QTT-TNCN — Quyết toán thuế TNCN', matchMode: 'core' },
+  { coreCode: '01/LPMB', label: '01/LPMB — Tờ khai lệ phí môn bài', matchMode: 'core' },
+];
+
+function readStore() {
+  const raw = getValue(STORAGE_KEYS.BOOKMARKS, null);
+  if (!raw || typeof raw !== 'object') {
+    return { schemaVersion: 1, global: [], byMst: {} };
+  }
+  return {
+    schemaVersion: 1,
+    global: Array.isArray(raw.global) ? [...raw.global] : [],
+    byMst: raw.byMst && typeof raw.byMst === 'object' ? { ...raw.byMst } : {},
+  };
+}
+
+function writeStore(store) {
+  setValue(STORAGE_KEYS.BOOKMARKS, {
+    schemaVersion: 1,
+    global: store.global || [],
+    byMst: store.byMst || {},
+  });
+}
+
+function normKey(item) {
+  const code = normalizeVietnamese(item.coreCode || '');
+  const exact = item.matchMode === 'exact' ? normalizeVietnamese(item.preferredOptionText || '') : '';
+  return `${code}|${item.matchMode || 'core'}|${exact}`;
+}
+
+function normalizeMst(mst) {
+  return String(mst || '').trim().toUpperCase();
+}
+
+function getBookmarksForMst(mst = '') {
+  const store = readStore();
+  const mstKey = normalizeMst(mst);
+  const mstList = mstKey && Array.isArray(store.byMst[mstKey]) ? [...store.byMst[mstKey]] : [];
+  return {
+    mstBookmarks: mstList,
+    globalBookmarks: [...store.global],
+    all: [...mstList.map((b) => ({ ...b, scope: 'mst' })), ...store.global.map((b) => ({ ...b, scope: 'global' }))],
+  };
+}
+
+function addBookmark({
+  coreCode,
+  label = '',
+  preferredOptionText = '',
+  matchMode = 'core',
+  scope = 'global',
+  mst = '',
+}) {
+  const cleanCode = String(coreCode || '').trim();
+  if (!cleanCode) return null;
+
+  const store = readStore();
+  const entry = {
+    id: `bm_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+    coreCode: cleanCode,
+    label: String(label || cleanCode).trim(),
+    preferredOptionText: String(preferredOptionText || '').trim(),
+    matchMode: matchMode === 'exact' && preferredOptionText ? 'exact' : 'core',
+    createdAt: new Date().toISOString(),
+  };
+
+  const targetKey = normKey(entry);
+
+  if (scope === 'mst') {
+    const mstKey = normalizeMst(mst);
+    if (!mstKey) return null;
+    const list = Array.isArray(store.byMst[mstKey]) ? [...store.byMst[mstKey]] : [];
+    if (list.some((b) => normKey(b) === targetKey)) return list.find((b) => normKey(b) === targetKey);
+    list.unshift(entry);
+    store.byMst[mstKey] = list;
+  } else {
+    if (store.global.some((b) => normKey(b) === targetKey)) {
+      return store.global.find((b) => normKey(b) === targetKey);
+    }
+    store.global.unshift(entry);
+  }
+
+  writeStore(store);
+  return entry;
+}
+
+function removeBookmark({ id, scope = 'global', mst = '' }) {
+  const store = readStore();
+  if (scope === 'mst') {
+    const mstKey = normalizeMst(mst);
+    if (mstKey && Array.isArray(store.byMst[mstKey])) {
+      store.byMst[mstKey] = store.byMst[mstKey].filter((b) => b.id !== id);
+      if (store.byMst[mstKey].length === 0) delete store.byMst[mstKey];
+    }
+  } else {
+    store.global = store.global.filter((b) => b.id !== id);
+  }
+  writeStore(store);
+}
+
+function findExistingBookmark({ coreCode, preferredOptionText = '', matchMode = 'core', scope = 'global', mst = '' }) {
+  const store = readStore();
+  const list =
+    scope === 'mst'
+      ? store.byMst[normalizeMst(mst)] || []
+      : store.global;
+  const targetKey = normKey({ coreCode, preferredOptionText, matchMode });
+  return list.find((b) => normKey(b) === targetKey) || null;
+}
+
+function seedStarterBookmarks() {
+  const store = readStore();
+  const existingKeys = new Set(store.global.map(normKey));
+  for (const preset of STARTER_DECLARATION_PRESETS) {
+    const item = {
+      id: `bm_seed_${preset.coreCode.replace(/[^a-z0-9]/gi, '_')}`,
+      coreCode: preset.coreCode,
+      label: preset.label,
+      preferredOptionText: '',
+      matchMode: preset.matchMode,
+      createdAt: new Date().toISOString(),
+    };
+    const key = normKey(item);
+    if (!existingKeys.has(key)) {
+      store.global.push(item);
+      existingKeys.add(key);
+    }
+  }
+  writeStore(store);
+  return store.global;
+}
+
+  __exports.getBookmarksForMst = getBookmarksForMst;
+  __exports.addBookmark = addBookmark;
+  __exports.removeBookmark = removeBookmark;
+  __exports.findExistingBookmark = findExistingBookmark;
+  __exports.seedStarterBookmarks = seedStarterBookmarks;
+  __exports.STARTER_DECLARATION_PRESETS = STARTER_DECLARATION_PRESETS;
+  },
+
+  "features/quick-access/declaration-matcher.js": function(__require, __exports) {
+const { normalizeVietnamese } = __require("adapters/etax-adapter.js");
+
+/**
+ * Tách "mã lõi" tờ khai từ chuỗi option trên `/tthc/thu-tuc-hanh-chinh` (484 mẫu):
+ * VD:
+ *  - "01/GTGT - TỜ KHAI THUẾ GIÁ TRỊ GIA TĂNG Mẫu số 01/GTGT (TT80/2021)" -> "01/GTGT"
+ *  - "05/KK-TNCN - Tờ khai khấu trừ thuế thu nhập cá nhân (TT89/2026)"   -> "05/KK-TNCN"
+ *  - "02/NTNN (TT80) - Tờ khai quyết toán..."                             -> "02/NTNN"
+ *  - "---Tất cả---"                                                       -> ""
+ */
+function extractCoreCode(optionText) {
+  const raw = String(optionText || '').replace(/\s+/g, ' ').trim();
+  if (!raw || raw.startsWith('---')) return '';
+
+  const sepIdx = raw.indexOf(' - ');
+  if (sepIdx > 0) {
+    let left = raw.slice(0, sepIdx).trim();
+    // Gỡ hậu tố thông tư dính trong phần mã nếu có, VD: "02/NTNN (TT80)" -> "02/NTNN"
+    left = left.replace(/\s*\((?:TT|ND|NĐ|QĐ|QD)[^)]*\)\s*$/i, '').trim();
+    return left;
+  }
+
+  return raw.slice(0, 40).trim();
+}
+
+/**
+ * Trích xuất năm Thông tư / Nghị định trong tên tờ khai để tự xếp mẫu mới nhất lên đầu
+ * (VD: TT89/2026 -> 2026, NĐ373/2025 -> 2025, TT80/2021 -> 2021, TT92/2015 -> 2015).
+ */
+function extractCircularYear(optionText) {
+  const raw = String(optionText || '');
+  // Ưu tiên dạng TTxx/YYYY, NĐxx/YYYY, QĐxx/YYYY
+  const m1 = raw.match(/(?:TT|NĐ|ND|QĐ|QD)\s*\d*\s*\/\s*(20\d{2})/i);
+  if (m1) return Number(m1[1]);
+  // Dạng "Nghị định số 245/2026/NĐ-CP" hoặc "thông tư 133/2016/TT-BTC"
+  const m2 = raw.match(/\/\s*(20\d{2})\s*\/(?:TT|NĐ|ND|QĐ|QD)/i);
+  if (m2) return Number(m2[1]);
+  // Dạng năm đơn lẻ trong ngoặc hoặc cuối câu (2000..2099)
+  const m3 = raw.match(/\b(20\d{2})\b/);
+  if (m3) return Number(m3[1]);
+  return 0;
+}
+
+/**
+ * Khớp danh sách `<option>` của dropdown Tờ khai với một Bookmark đã ghim:
+ * - Nếu ghim đích danh (`matchMode === 'exact'`) và mẫu đó vẫn còn tồn tại -> trả đúng 1 mẫu (`single`).
+ * - Nếu ghim theo mã lõi (`core`) hoặc mẫu đích danh đã bị đổi tên sang thông tư mới -> lọc mọi mẫu cùng mã lõi,
+ *   xếp Thông tư năm mới nhất lên trên cùng!
+ */
+function matchDeclarationOptions(options, bookmark) {
+  if (!Array.isArray(options) || !bookmark) {
+    return { mode: 'none', match: null, candidates: [] };
+  }
+
+  const validOptions = options.filter((o) => {
+    const t = String(o?.text || '').trim();
+    return t && !t.startsWith('---') && o.value !== '';
+  });
+
+  if (bookmark.matchMode === 'exact' && bookmark.preferredOptionText) {
+    const targetExact = normalizeVietnamese(bookmark.preferredOptionText);
+    const exactHit = validOptions.find((o) => normalizeVietnamese(o.text) === targetExact);
+    if (exactHit) {
+      return { mode: 'single', match: exactHit, candidates: [exactHit] };
+    }
+  }
+
+  const targetCore = normalizeVietnamese(bookmark.coreCode || '');
+  if (!targetCore) {
+    return { mode: 'none', match: null, candidates: [] };
+  }
+
+  const candidates = validOptions.filter((o) => {
+    const optCore = normalizeVietnamese(extractCoreCode(o.text));
+    if (optCore === targetCore) return true;
+    // Xử lý mẫu gộp mã như "01/NTNN, NCCNN - ..." khi tìm "01/NTNN"
+    const parts = optCore.split(/[,;]/).map((s) => s.trim());
+    return parts.includes(targetCore);
+  });
+
+  // Sắp xếp Thông tư năm mới nhất lên đầu (TT89/2026 > NĐ373/2025 > TT80/2021 > TT92/2015 > chưa ghi năm)
+  candidates.sort((a, b) => {
+    const ya = extractCircularYear(a.text);
+    const yb = extractCircularYear(b.text);
+    if (ya !== yb) return yb - ya;
+    return a.text.localeCompare(b.text, 'vi');
+  });
+
+  if (candidates.length === 0) {
+    return { mode: 'none', match: null, candidates: [] };
+  }
+  if (candidates.length === 1) {
+    return { mode: 'single', match: candidates[0], candidates };
+  }
+  return { mode: 'multiple', match: null, candidates };
+}
+
+/**
+ * Từ danh sách nút `a.nop-hoso-btn` trong `#bangKetQuaTTHC`, loại trừ "Khai bổ sung hồ sơ khai thuế"
+ * (`ma-tthc="1.008327"`) để luôn ưu tiên chọn **Nộp tờ khai mới (chính thức)**.
+ */
+function selectOfficialProcedure(buttons = []) {
+  if (!Array.isArray(buttons) || buttons.length === 0) {
+    return { action: 'none', target: null, officialButtons: [] };
+  }
+
+  const official = buttons.filter((b) => {
+    if (b.isSupplementary) return false;
+    const normTen = normalizeVietnamese(b.tenTthc || '');
+    if (b.maTthc === '1.008327' || normTen.includes('khai bo sung')) return false;
+    return true;
+  });
+
+  if (official.length === 1) {
+    return { action: 'auto-click', target: official[0], officialButtons: official };
+  }
+  if (official.length >= 2) {
+    return { action: 'highlight-multiple', target: null, officialButtons: official };
+  }
+  return { action: 'none', target: null, officialButtons: [] };
+}
+
+  __exports.extractCoreCode = extractCoreCode;
+  __exports.extractCircularYear = extractCircularYear;
+  __exports.matchDeclarationOptions = matchDeclarationOptions;
+  __exports.selectOfficialProcedure = selectOfficialProcedure;
+  },
+
+  "features/quick-access/index.js": function(__require, __exports) {
+const { isLoggedIn, isDvcOrigin, isEtaxOrigin, TTHC_DECLARATION_URL, scanPortalMenuItems, isTthcDeclarationPage, findDeclarationSelectContext, findTthcProcedureButtons, normalizeVietnamese } = __require("adapters/etax-adapter.js");
+const { isTopFrame, notifyOpenQuickAccess, subscribeOpenQuickAccess } = __require("core/frame-bus.js");
+const { createDomWatcher } = __require("core/dom-observer.js");
+const { createShadowMount } = __require("ui/shadow-host.js");
+const { activateDockSlot, deactivateDockSlot, getDockSlotContainer, notifyDockSlotUpdated, toggleDockPopover, openDockPopover, closeDockPopover, getActiveDockPopoverId, injectDockStyle } = __require("ui/unified-dock.js");
+const { getActiveCompanyContext } = __require("features/company-bar/note-store.js");
+const { getBookmarksForMst, addBookmark, removeBookmark, findExistingBookmark, seedStarterBookmarks } = __require("features/quick-access/bookmark-store.js");
+const { extractCoreCode, extractCircularYear, matchDeclarationOptions, selectOfficialProcedure } = __require("features/quick-access/declaration-matcher.js");
+
+const PENDING_INTENT_KEY = '__etax_helper_qa_pending_intent_v2';
+const INTENT_TTL_MS = 20000;
+
+const QA_DOCK_CSS = `
+.eh-qa-sec-title {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  color: #64748b;
+  margin: 10px 0 6px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.eh-qa-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.eh-qa-bm {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 9px;
+  border-radius: 8px;
+  border: 1px solid #bfdbfe;
+  background: #eff6ff;
+  color: #005a99;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  max-width: 100%;
+}
+.eh-qa-bm:hover {
+  background: #dbeafe;
+  border-color: #60a5fa;
+}
+.eh-qa-bm.mst-scope {
+  background: #fffbeb;
+  border-color: #fcd34d;
+  color: #92400e;
+}
+.eh-qa-bm.mst-scope:hover {
+  background: #fef3c7;
+}
+.eh-qa-bm-del {
+  border: none;
+  background: transparent;
+  color: #94a3b8;
+  font-weight: 700;
+  cursor: pointer;
+  padding: 0 2px;
+  font-size: 13px;
+  line-height: 1;
+}
+.eh-qa-bm-del:hover { color: #dc2626; }
+.eh-qa-menu-list {
+  max-height: 210px;
+  overflow-y: auto;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+}
+.eh-qa-menu-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 7px 10px;
+  border-bottom: 1px solid #f1f5f9;
+  cursor: pointer;
+  font-size: 12.5px;
+}
+.eh-qa-menu-row:last-child { border-bottom: none; }
+.eh-qa-menu-row:hover, .eh-qa-menu-row.focused {
+  background: #eff6ff;
+  color: #006FBC;
+}
+.eh-qa-group {
+  font-size: 11px;
+  color: #64748b;
+  white-space: nowrap;
+}
+`;
+
+const INLINE_PIN_CSS = `
+.eh-pin-bar {
+  margin-top: 6px;
+  padding: 6px 9px;
+  border: 1px solid #bae0ff;
+  border-radius: 8px;
+  background: #f0f8ff;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.eh-pin-info {
+  font-size: 12px;
+  color: #0f172a;
+}
+.eh-pin-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.eh-picker-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.35);
+  z-index: 2147483645;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+}
+.eh-picker-card {
+  width: min(560px, 100%);
+  max-height: 80vh;
+  overflow-y: auto;
+  background: #ffffff;
+  border-radius: 12px;
+  border: 1.5px solid #006FBC;
+  box-shadow: 0 20px 50px rgba(15, 23, 42, 0.28);
+  padding: 14px 16px;
+}
+.eh-ver-item {
+  padding: 9px 11px;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  margin-bottom: 7px;
+  cursor: pointer;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+.eh-ver-item:hover {
+  background: #eff6ff;
+  border-color: #006FBC;
+}
+.eh-ver-new {
+  background: #dcfce7;
+  color: #166534;
+  border: 1px solid #86efac;
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+`;
+
+function esc(str) {
+  return String(str ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function getPageWindow() {
+  try {
+    return typeof unsafeWindow !== 'undefined' && unsafeWindow ? unsafeWindow : window;
+  } catch {
+    return window;
+  }
+}
+
+function savePendingIntent(intent) {
+  try {
+    window.sessionStorage.setItem(
+      PENDING_INTENT_KEY,
+      JSON.stringify({ ...intent, expiresAt: Date.now() + INTENT_TTL_MS }),
+    );
+  } catch {
+    // ignore
+  }
+}
+
+function consumePendingIntent() {
+  try {
+    const raw = window.sessionStorage.getItem(PENDING_INTENT_KEY);
+    if (!raw) return null;
+    window.sessionStorage.removeItem(PENDING_INTENT_KEY);
+    const parsed = JSON.parse(raw);
+    if (!parsed || !parsed.expiresAt || Date.now() > parsed.expiresAt) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function selectBootstrapOption(ctx, optionEl) {
+  if (!ctx?.selectEl || !optionEl) return false;
+  ctx.selectEl.value = optionEl.value;
+  optionEl.selected = true;
+  ctx.selectEl.dispatchEvent(new Event('change', { bubbles: true }));
+
+  // Cập nhật giao diện nút bootstrap-select ngay lập tức
+  if (ctx.toggleBtn) {
+    ctx.toggleBtn.classList.remove('bs-placeholder');
+    ctx.toggleBtn.setAttribute('title', optionEl.textContent || '');
+    const inner = ctx.toggleBtn.querySelector('.filter-option-inner-inner');
+    if (inner) inner.textContent = optionEl.textContent || '';
+  }
+
+  // Đồng bộ qua jQuery selectpicker nếu có sẵn trên trang
+  try {
+    const pw = getPageWindow();
+    if (pw.jQuery && typeof pw.jQuery(ctx.selectEl).selectpicker === 'function') {
+      pw.jQuery(ctx.selectEl).selectpicker('val', optionEl.value);
+      pw.jQuery(ctx.selectEl).selectpicker('refresh');
+    }
+  } catch {
+    // ignore
+  }
+  return true;
+}
+
+function createQuickAccessFeature() {
+  let active = false;
+  let watcher = null;
+  let unsubOpenBus = null;
+  let keydownHandler = null;
+
+  let searchQuery = '';
+  let focusedIndex = 0;
+  let showQuickAddForm = false;
+  let statusBanner = null;
+
+  let inlinePinHost = null;
+  let inlinePinRoot = null;
+  let boundSelectEl = null;
+  let selectChangeListener = null;
+  let versionPickerHost = null;
+  let versionPickerCleanup = null;
+
+  const getCurrentMst = () => getActiveCompanyContext().mst || '';
+
+  const closeVersionPicker = () => {
+    if (versionPickerCleanup) {
+      versionPickerCleanup();
+      versionPickerCleanup = null;
+    }
+    if (versionPickerHost) {
+      versionPickerHost.remove();
+      versionPickerHost = null;
+    }
+  };
+
+  const triggerSearchAndOpenOfficial = (ctx) => {
+    if (!ctx?.searchButton) return;
+    const container = ctx.resultContainer || document.querySelector('#bangKetQuaTTHC');
+    const prevHtml = container ? container.innerHTML : '';
+    let handled = false;
+
+    const finalize = () => {
+      if (handled) return;
+      handled = true;
+      document.removeEventListener('htmx:afterSettle', onSettle);
+      const buttons = findTthcProcedureButtons(document);
+      const decision = selectOfficialProcedure(buttons);
+
+      if (decision.action === 'auto-click' && decision.target?.el) {
+        decision.target.el.click();
+        return;
+      }
+
+      if (decision.action === 'highlight-multiple') {
+        const resBox = document.querySelector('#bangKetQuaTTHC');
+        resBox?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        for (const btn of buttons) {
+          const tr = btn.el.closest('tr');
+          if (!tr) continue;
+          if (btn.isSupplementary) {
+            tr.style.opacity = '0.45';
+          } else {
+            tr.style.outline = '2px solid #006FBC';
+            tr.style.backgroundColor = '#eff6ff';
+          }
+        }
+      }
+    };
+
+    const onSettle = (event) => {
+      const target = event?.detail?.target || event?.target;
+      if (target && (target.id === 'bangKetQuaTTHC' || target.querySelector?.('#bangKetQuaTTHC'))) {
+        setTimeout(finalize, 60);
+      }
+    };
+
+    document.addEventListener('htmx:afterSettle', onSettle);
+    ctx.searchButton.click();
+
+    // Dự phòng nếu HTMX swap xong không bắn afterSettle trên target mong đợi
+    const started = Date.now();
+    const poll = () => {
+      if (handled) return;
+      const box = document.querySelector('#bangKetQuaTTHC');
+      if (box && box.innerHTML !== prevHtml && box.querySelector('a.nop-hoso-btn')) {
+        setTimeout(finalize, 80);
+        return;
+      }
+      if (Date.now() - started < 6000) {
+        setTimeout(poll, 160);
+      } else {
+        document.removeEventListener('htmx:afterSettle', onSettle);
+      }
+    };
+    setTimeout(poll, 220);
+  };
+
+  const openVersionPickerModal = (ctx, bookmark, candidates) => {
+    closeVersionPicker();
+    const { host, root, cleanup } = createShadowMount(
+      'div',
+      INLINE_PIN_CSS,
+      { 'data-etax-role': 'declaration-version-picker' },
+      { guardBootstrapFocusTrap: true },
+    );
+    versionPickerHost = host;
+    versionPickerCleanup = cleanup;
+    document.body.appendChild(host);
+
+    const maxYear = Math.max(...candidates.map((c) => extractCircularYear(c.text)));
+
+    root.innerHTML = `
+      <div class="eh-picker-backdrop" id="eh-vp-bg">
+        <div class="eh-picker-card">
+          <div style="display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:8px;">
+            <strong style="color:#006FBC; font-size:14px;">★ Chọn phiên bản Thông tư cho "${esc(bookmark.coreCode)}"</strong>
+            <button type="button" class="eh-btn eh-btn-sm" id="eh-vp-close">Đóng</button>
+          </div>
+          <div class="eh-muted" style="margin-bottom:10px;">
+            Có ${candidates.length} mẫu tờ khai khớp mã lõi <strong>${esc(bookmark.coreCode)}</strong> (mẫu Thông tư mới nhất được xếp trên cùng). Bấm chọn để tự tìm &amp; mở <strong>Tờ khai mới</strong>:
+          </div>
+          <div>
+            ${candidates
+              .map((c, idx) => {
+                const yr = extractCircularYear(c.text);
+                const isNewest = yr > 0 && yr === maxYear;
+                return `
+                  <div class="eh-ver-item" data-idx="${idx}">
+                    <span style="font-size:12.5px; color:#0f172a; line-height:1.4;">${esc(c.text)}</span>
+                    ${isNewest ? `<span class="eh-ver-new">Mới nhất (${yr})</span>` : yr > 0 ? `<span class="eh-muted">${yr}</span>` : ''}
+                  </div>
+                `;
+              })
+              .join('')}
+          </div>
+        </div>
+      </div>
+    `;
+
+    root.querySelector('#eh-vp-close')?.addEventListener('click', closeVersionPicker);
+    root.querySelector('#eh-vp-bg')?.addEventListener('click', (e) => {
+      if (e.target.id === 'eh-vp-bg') closeVersionPicker();
+    });
+    root.querySelectorAll('.eh-ver-item').forEach((el) => {
+      el.addEventListener('click', () => {
+        const picked = candidates[Number(el.dataset.idx)];
+        closeVersionPicker();
+        if (picked?.optionEl) {
+          selectBootstrapOption(ctx, picked.optionEl);
+          triggerSearchAndOpenOfficial(ctx);
+        }
+      });
+    });
+  };
+
+  const executeDeclarationBookmarkOnPage = (bookmark) => {
+    const ctx = findDeclarationSelectContext(document);
+    if (!ctx) return false;
+
+    const options = Array.from(ctx.selectEl.options).map((opt, index) => ({
+      value: opt.value,
+      text: (opt.textContent || '').replace(/\s+/g, ' ').trim(),
+      index,
+      optionEl: opt,
+    }));
+
+    const matched = matchDeclarationOptions(options, bookmark);
+    if (matched.mode === 'single' && matched.match?.optionEl) {
+      selectBootstrapOption(ctx, matched.match.optionEl);
+      triggerSearchAndOpenOfficial(ctx);
+      return true;
+    }
+    if (matched.mode === 'multiple') {
+      openVersionPickerModal(ctx, bookmark, matched.candidates);
+      return true;
+    }
+
+    // Không khớp được mã lõi -> mở dropdown để người dùng xem
+    window.alert(`Không tìm thấy tờ khai nào khớp mã "${bookmark.coreCode}" trong danh sách hiện tại.`);
+    return true;
+  };
+
+  const launchBookmark = (bookmark) => {
+    closeDockPopover('quickAccess');
+    if (isTthcDeclarationPage(location, document)) {
+      executeDeclarationBookmarkOnPage(bookmark);
+      return;
+    }
+    savePendingIntent({ type: 'OPEN_DECLARATION', bookmark });
+    location.href = TTHC_DECLARATION_URL;
+  };
+
+  const renderPalettePopover = (popEl) => {
+    injectDockStyle('quick-access-css', QA_DOCK_CSS);
+
+    const mst = getCurrentMst();
+    const { mstBookmarks, globalBookmarks } = getBookmarksForMst(mst);
+    const menuItems = scanPortalMenuItems(document);
+    const q = normalizeVietnamese(searchQuery);
+
+    const filterBm = (list) =>
+      q
+        ? list.filter(
+            (b) =>
+              normalizeVietnamese(b.coreCode).includes(q) ||
+              normalizeVietnamese(b.label).includes(q) ||
+              normalizeVietnamese(b.preferredOptionText).includes(q),
+          )
+        : list;
+
+    const filteredMstBm = filterBm(mstBookmarks);
+    const filteredGlobalBm = filterBm(globalBookmarks);
+    const filteredMenus = q
+      ? menuItems.filter(
+          (m) =>
+            normalizeVietnamese(m.label).includes(q) ||
+            normalizeVietnamese(m.group).includes(q),
+        )
+      : menuItems;
+
+    const totalBookmarks = mstBookmarks.length + globalBookmarks.length;
+    if (focusedIndex >= filteredMenus.length) focusedIndex = 0;
+
+    const renderBmChip = (b, scope) => `
+      <span class="eh-qa-bm ${scope === 'mst' ? 'mst-scope' : ''}" data-bm-id="${esc(b.id)}" data-bm-scope="${scope}"
+        title="Bấm để mở ngay Tờ khai mới cho ${esc(b.coreCode)}${b.preferredOptionText ? `\n(${esc(b.preferredOptionText)})` : ''}">
+        <span class="eh-qa-bm-run">${scope === 'mst' ? '🏢' : '★'} ${esc(b.coreCode)}${
+          b.label && b.label !== b.coreCode ? ` <span style="font-weight:400; opacity:0.85;">· ${esc(b.label.replace(new RegExp(`^${b.coreCode}\\s*[-—–:]?\\s*`, 'i'), '').slice(0, 26))}</span>` : ''
+        }</span>
+        <button type="button" class="eh-qa-bm-del" data-del-id="${esc(b.id)}" data-del-scope="${scope}" title="Bỏ ghim">×</button>
+      </span>
+    `;
+
+    popEl.innerHTML = `
+      <div class="eh-pop-head">
+        <div class="eh-pop-title">⚡ Truy cập nhanh &amp; Tờ khai đã ghim <span class="eh-muted" style="font-weight:500;">(Ctrl + K)</span></div>
+        <button type="button" class="eh-pop-close" id="eh-qa-close" title="Đóng">×</button>
+      </div>
+      <input type="text" class="eh-input" id="eh-qa-search" value="${esc(searchQuery)}"
+        placeholder="🔍 Gõ tên chức năng (Lập GNT, Tra cứu...) hoặc mã tờ khai (01/GTGT)..." autocomplete="off"/>
+
+      <div class="eh-qa-sec-title">
+        <span>★ Tờ khai đã ghim (1 chạm → tự mở Tờ khai mới)</span>
+        <button type="button" class="eh-btn eh-btn-sm" id="eh-qa-toggle-add">${showQuickAddForm ? 'Ẩn' : '+ Ghim mã'}</button>
+      </div>
+
+      ${
+        showQuickAddForm
+          ? `
+        <div style="padding:8px; margin-bottom:8px; border:1px solid #bae0ff; border-radius:8px; background:#f8fafc;">
+          <div style="display:flex; gap:6px; margin-bottom:6px;">
+            <input type="text" class="eh-input" id="eh-qa-add-code" placeholder="Mã lõi (VD: 01/GTGT, 05/KK-TNCN)..." style="flex:1;"/>
+            <select class="eh-select" id="eh-qa-add-scope" style="width:140px;">
+              <option value="global">Ghim chung</option>
+              ${mst ? `<option value="mst">Riêng MST ${esc(mst)}</option>` : ''}
+            </select>
+          </div>
+          <div style="display:flex; gap:6px;">
+            <input type="text" class="eh-input" id="eh-qa-add-label" placeholder="Tên gợi nhớ ngắn (không bắt buộc)..." style="flex:1;"/>
+            <button type="button" class="eh-btn eh-btn-primary eh-btn-sm" id="eh-qa-add-save">Ghim</button>
+          </div>
+        </div>
+      `
+          : ''
+      }
+
+      ${
+        totalBookmarks === 0
+          ? `
+        <div style="padding:10px; border:1px dashed #cbd5e1; border-radius:8px; text-align:center; background:#f8fafc;">
+          <div class="eh-muted" style="margin-bottom:6px;">Chưa ghim tờ khai nào. Bạn có thể bấm nút <strong>☆ Ghim</strong> ngay trên trang <em>Thủ tục hành chính</em> hoặc nạp nhanh 5 mẫu DN phổ biến:</div>
+          <button type="button" class="eh-btn eh-btn-primary eh-btn-sm" id="eh-qa-seed">✨ Nạp nhanh 5 tờ khai DN phổ biến</button>
+        </div>
+      `
+          : `
+        ${
+          filteredMstBm.length > 0
+            ? `<div style="margin-bottom:6px;">
+                <div class="eh-muted" style="font-size:11px; margin-bottom:4px;">Ghim riêng cho MST ${esc(mst)}:</div>
+                <div class="eh-qa-chips">${filteredMstBm.map((b) => renderBmChip(b, 'mst')).join('')}</div>
+              </div>`
+            : ''
+        }
+        ${
+          filteredGlobalBm.length > 0
+            ? `<div class="eh-qa-chips">${filteredGlobalBm.map((b) => renderBmChip(b, 'global')).join('')}</div>`
+            : filteredMstBm.length === 0
+              ? '<div class="eh-muted" style="font-size:12px;">Không có tờ khai đã ghim nào khớp từ khóa.</div>'
+              : ''
+        }
+      `
+      }
+
+      ${statusBanner ? `<div class="eh-success" style="margin-top:7px;">${esc(statusBanner)}</div>` : ''}
+
+      <div class="eh-qa-sec-title">
+        <span>🧭 Chức năng cổng Thuế (quét động Menu)</span>
+        <span>${filteredMenus.length} mục</span>
+      </div>
+      <div class="eh-qa-menu-list">
+        ${
+          filteredMenus.length === 0
+            ? '<div style="padding:10px; text-align:center;" class="eh-muted">Không có mục menu nào khớp.</div>'
+            : filteredMenus
+                .map(
+                  (m, i) => `
+              <div class="eh-qa-menu-row ${i === focusedIndex ? 'focused' : ''}" data-menu-idx="${i}">
+                <span>${esc(m.label)}</span>
+                <span class="eh-qa-group">${esc(m.group)}</span>
+              </div>`,
+                )
+                .join('')
+        }
+      </div>
+    `;
+
+    popEl.querySelector('#eh-qa-close')?.addEventListener('click', () => closeDockPopover('quickAccess'));
+
+    popEl.querySelector('#eh-qa-toggle-add')?.addEventListener('click', () => {
+      showQuickAddForm = !showQuickAddForm;
+      statusBanner = null;
+      renderPalettePopover(popEl);
+      if (showQuickAddForm) popEl.querySelector('#eh-qa-add-code')?.focus();
+    });
+
+    popEl.querySelector('#eh-qa-add-save')?.addEventListener('click', () => {
+      const code = (popEl.querySelector('#eh-qa-add-code')?.value || '').trim();
+      const label = (popEl.querySelector('#eh-qa-add-label')?.value || '').trim();
+      const scope = popEl.querySelector('#eh-qa-add-scope')?.value || 'global';
+      if (!code) return;
+      addBookmark({ coreCode: code, label: label || code, matchMode: 'core', scope, mst });
+      showQuickAddForm = false;
+      statusBanner = `Đã ghim tờ khai "${code}"!`;
+      renderPalettePopover(popEl);
+    });
+
+    popEl.querySelector('#eh-qa-seed')?.addEventListener('click', () => {
+      seedStarterBookmarks();
+      statusBanner = 'Đã nạp 5 tờ khai DN phổ biến!';
+      renderPalettePopover(popEl);
+    });
+
+    // Chạy tờ khai đã ghim hoặc xóa ghim
+    popEl.querySelectorAll('.eh-qa-bm').forEach((chip) => {
+      chip.addEventListener('click', (e) => {
+        if (e.target.closest('.eh-qa-bm-del')) return;
+        const id = chip.dataset.bmId;
+        const scope = chip.dataset.bmScope;
+        const list = scope === 'mst' ? mstBookmarks : globalBookmarks;
+        const target = list.find((b) => b.id === id);
+        if (target) launchBookmark(target);
+      });
+    });
+
+    popEl.querySelectorAll('.eh-qa-bm-del').forEach((btn) => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        removeBookmark({ id: btn.dataset.delId, scope: btn.dataset.delScope, mst });
+        statusBanner = null;
+        renderPalettePopover(popEl);
+      });
+    });
+
+    const activateMenu = (item) => {
+      if (!item) return;
+      closeDockPopover('quickAccess');
+      if (item.el && document.contains(item.el)) {
+        item.el.click();
+      } else if (item.href) {
+        location.href = item.href;
+      }
+    };
+
+    popEl.querySelectorAll('.eh-qa-menu-row').forEach((row) => {
+      row.addEventListener('click', () => {
+        activateMenu(filteredMenus[Number(row.dataset.menuIdx)]);
+      });
+    });
+
+    const searchInput = popEl.querySelector('#eh-qa-search');
+    if (searchInput && !showQuickAddForm) {
+      searchInput.focus();
+      searchInput.setSelectionRange(searchQuery.length, searchQuery.length);
+      searchInput.addEventListener('input', (e) => {
+        searchQuery = e.target.value;
+        focusedIndex = 0;
+        statusBanner = null;
+        renderPalettePopover(popEl);
+      });
+      searchInput.addEventListener('keydown', (e) => {
+        if (e.key === 'ArrowDown' && filteredMenus.length > 0) {
+          e.preventDefault();
+          focusedIndex = (focusedIndex + 1) % filteredMenus.length;
+          renderPalettePopover(popEl);
+        } else if (e.key === 'ArrowUp' && filteredMenus.length > 0) {
+          e.preventDefault();
+          focusedIndex = (focusedIndex - 1 + filteredMenus.length) % filteredMenus.length;
+          renderPalettePopover(popEl);
+        } else if (e.key === 'Enter' && filteredMenus.length > 0) {
+          e.preventDefault();
+          activateMenu(filteredMenus[focusedIndex]);
+        }
+      });
+    }
+  };
+
+  const openPalette = () => {
+    if (!active || !isLoggedIn(document, location)) return;
+    statusBanner = null;
+    openDockPopover('quickAccess', renderPalettePopover, {
+      maxWidth: '500px',
+      onClose: () => renderDockButton(),
+    });
+    renderDockButton();
+  };
+
+  const renderDockButton = () => {
+    if (!active) return;
+    if (!isLoggedIn(document, location)) {
+      deactivateDockSlot('quickAccess');
+      return;
+    }
+    const slot = getDockSlotContainer('quickAccess') || activateDockSlot('quickAccess');
+    if (!slot) return;
+
+    const popOpen = getActiveDockPopoverId() === 'quickAccess';
+    slot.innerHTML = `
+      <button type="button" class="eh-dock-chip eh-hide-collapsed ${popOpen ? 'active' : ''}" id="eh-qa-btn"
+        title="Mở Truy cập nhanh & Tờ khai đã ghim (Phím tắt: Ctrl + K)">
+        ⚡ <span>Truy cập nhanh</span>
+      </button>
+    `;
+    slot.querySelector('#eh-qa-btn')?.addEventListener('click', () => {
+      statusBanner = null;
+      toggleDockPopover('quickAccess', renderPalettePopover, {
+        maxWidth: '500px',
+        onClose: () => renderDockButton(),
+      });
+      renderDockButton();
+    });
+    notifyDockSlotUpdated('quickAccess');
+  };
+
+  // ============================================================================
+  // THANH GHIM TRỰC TIẾP TRÊN TRANG `/tthc/thu-tuc-hanh-chinh`
+  // ============================================================================
+
+  const renderInlinePinBar = (ctx) => {
+    if (!inlinePinRoot || !ctx?.selectEl) return;
+    const opt = ctx.selectEl.options[ctx.selectEl.selectedIndex];
+    const optText = opt && opt.value ? (opt.textContent || '').replace(/\s+/g, ' ').trim() : '';
+    const coreCode = extractCoreCode(optText);
+    const mst = getCurrentMst();
+
+    if (!coreCode) {
+      inlinePinRoot.innerHTML = `
+        <div class="eh-pin-bar">
+          <span class="eh-pin-info eh-muted">★ Chọn một <strong>Tờ khai</strong> ở ô trên để Ghim 1 chạm vào khung Truy cập nhanh (Ctrl + K).</span>
+        </div>
+      `;
+      return;
+    }
+
+    const existingGlobal = findExistingBookmark({ coreCode, matchMode: 'core', scope: 'global' });
+    const existingMst = mst
+      ? findExistingBookmark({ coreCode, matchMode: 'core', scope: 'mst', mst })
+      : null;
+
+    inlinePinRoot.innerHTML = `
+      <div class="eh-pin-bar">
+        <span class="eh-pin-info">Mã lõi: <strong>${esc(coreCode)}</strong></span>
+        <div class="eh-pin-actions">
+          <button type="button" class="eh-btn eh-btn-sm ${existingGlobal ? 'eh-btn-primary' : ''}" id="eh-pin-global">
+            ${existingGlobal ? '★ Đã ghim chung' : '☆ Ghim chung (mọi Cty)'}
+          </button>
+          ${
+            mst
+              ? `<button type="button" class="eh-btn eh-btn-sm ${existingMst ? 'eh-btn-primary' : ''}" id="eh-pin-mst">
+                  ${existingMst ? `★ Đã ghim MST ${esc(mst)}` : `☆ Ghim riêng MST ${esc(mst)}`}
+                </button>`
+              : ''
+          }
+        </div>
+      </div>
+    `;
+
+    inlinePinRoot.querySelector('#eh-pin-global')?.addEventListener('click', () => {
+      if (existingGlobal) {
+        removeBookmark({ id: existingGlobal.id, scope: 'global' });
+      } else {
+        addBookmark({
+          coreCode,
+          label: optText.slice(0, 60),
+          preferredOptionText: optText,
+          matchMode: 'core',
+          scope: 'global',
+        });
+      }
+      renderInlinePinBar(ctx);
+    });
+
+    inlinePinRoot.querySelector('#eh-pin-mst')?.addEventListener('click', () => {
+      if (!mst) return;
+      if (existingMst) {
+        removeBookmark({ id: existingMst.id, scope: 'mst', mst });
+      } else {
+        addBookmark({
+          coreCode,
+          label: optText.slice(0, 60),
+          preferredOptionText: optText,
+          matchMode: 'core',
+          scope: 'mst',
+          mst,
+        });
+      }
+      renderInlinePinBar(ctx);
+    });
+  };
+
+  const mountInlinePinIfOnTthcPage = () => {
+    if (!isTthcDeclarationPage(location, document)) return;
+    const ctx = findDeclarationSelectContext(document);
+    if (!ctx) return;
+
+    const anchorParent = ctx.wrapper || ctx.selectEl;
+    if (!inlinePinHost || !document.contains(inlinePinHost)) {
+      const { host, root } = createShadowMount('div', INLINE_PIN_CSS, {
+        'data-etax-role': 'tthc-inline-pin',
+      });
+      inlinePinHost = host;
+      inlinePinRoot = root;
+      anchorParent.insertAdjacentElement('afterend', host);
+    }
+
+    if (boundSelectEl !== ctx.selectEl) {
+      if (boundSelectEl && selectChangeListener) {
+        boundSelectEl.removeEventListener('change', selectChangeListener);
+      }
+      boundSelectEl = ctx.selectEl;
+      selectChangeListener = () => renderInlinePinBar(ctx);
+      boundSelectEl.addEventListener('change', selectChangeListener);
+    }
+
+    renderInlinePinBar(ctx);
+
+    // Kiểm tra và thực thi Pending Intent nếu vừa điều hướng từ nút Ghim tờ khai sang
+    const pending = consumePendingIntent();
+    if (pending && pending.type === 'OPEN_DECLARATION' && pending.bookmark) {
+      setTimeout(() => executeDeclarationBookmarkOnPage(pending.bookmark), 120);
+    }
+  };
+
+  const scanTopFrame = () => {
+    if (!active) return;
+    renderDockButton();
+    mountInlinePinIfOnTthcPage();
+  };
+
+  return {
+    start() {
+      active = true;
+
+      // Phím tắt Ctrl + K hoạt động ở CẢ Top-Frame (dichvucong) lẫn iframe (thuedientu)
+      keydownHandler = (e) => {
+        if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'k') {
+          e.preventDefault();
+          e.stopPropagation();
+          if (isTopFrame() && isDvcOrigin(location.origin)) {
+            if (getActiveDockPopoverId() === 'quickAccess') {
+              closeDockPopover('quickAccess');
+            } else {
+              openPalette();
+            }
+          } else if (isEtaxOrigin(location.origin)) {
+            notifyOpenQuickAccess('iframe-ctrl-k');
+          }
+        }
+      };
+      window.addEventListener('keydown', keydownHandler, true);
+
+      if (!isTopFrame() || !isDvcOrigin(location.origin)) return;
+
+      unsubOpenBus = subscribeOpenQuickAccess(() => {
+        openPalette();
+      });
+
+      watcher = createDomWatcher(scanTopFrame, { debounceMs: 220 });
+      watcher.start();
+    },
+
+    stop() {
+      active = false;
+      closeVersionPicker();
+      if (keydownHandler) {
+        window.removeEventListener('keydown', keydownHandler, true);
+        keydownHandler = null;
+      }
+      if (unsubOpenBus) {
+        unsubOpenBus();
+        unsubOpenBus = null;
+      }
+      if (watcher) {
+        watcher.stop();
+        watcher = null;
+      }
+      if (boundSelectEl && selectChangeListener) {
+        boundSelectEl.removeEventListener('change', selectChangeListener);
+        boundSelectEl = null;
+        selectChangeListener = null;
+      }
+      if (inlinePinHost) {
+        inlinePinHost.remove();
+        inlinePinHost = null;
+        inlinePinRoot = null;
+      }
+      closeDockPopover('quickAccess');
+      deactivateDockSlot('quickAccess');
+    },
+  };
+}
+
+  __exports.createQuickAccessFeature = createQuickAccessFeature;
+  },
+
+  "features/signing-status/probe.js": function(__require, __exports) {
+const { DEFAULT_SIGNING_PORTS } = __require("adapters/etax-adapter.js");
+
+/**
+ * Kiểm tra cổng cục bộ của phần mềm ký số (CT SigningHub :32001 & eSigner Java :8768)
+ * bằng `GM_xmlhttpRequest` tới ĐƯỜNG DẪN GỐC `/` trên `127.0.0.1` (Loopback Only).
+ *
+ * QUY TẮC AN TOÀN TUYỆT ĐỐI:
+ * - TUYỆT ĐỐI KHÔNG gọi `/api/hubclient/GetCert` hay `/signhash` vì sẽ làm bật pop-up nhập PIN Token trên Windows!
+ * - Mọi phản hồi HTTP có `status > 0` (kể cả 200, 400, 404, 405, 426...) đều xác nhận dịch vụ đang chạy trên cổng đó.
+ */
+
+function normalizePort(port, fallback) {
+  const n = Number(port);
+  return Number.isInteger(n) && n >= 1 && n <= 65535 ? n : fallback;
+}
+
+function runSingleHttpProbe(url, timeoutMs, requester) {
+  return new Promise((resolve) => {
+    const started = Date.now();
+    try {
+      requester({
+        method: 'GET',
+        url,
+        timeout: timeoutMs,
+        anonymous: true,
+        onload(resp) {
+          const status = Number(resp?.status || 0);
+          resolve({
+            online: status > 0,
+            status,
+            latencyMs: Date.now() - started,
+            reason: status > 0 ? `HTTP ${status}` : 'Không có mã phản hồi HTTP',
+          });
+        },
+        onerror() {
+          resolve({
+            online: false,
+            status: 0,
+            latencyMs: Date.now() - started,
+            reason: 'Không kết nối được cổng (ứng dụng chưa bật)',
+          });
+        },
+        ontimeout() {
+          resolve({
+            online: false,
+            status: 0,
+            latencyMs: Date.now() - started,
+            reason: 'Quá thời gian chờ phản hồi',
+          });
+        },
+      });
+    } catch (err) {
+      resolve({
+        online: false,
+        status: 0,
+        latencyMs: Date.now() - started,
+        reason: err?.message || 'Lỗi gọi GM_xmlhttpRequest',
+      });
+    }
+  });
+}
+
+async function probeLocalSigningPort({
+  port,
+  tryHttpsFallback = false,
+  timeoutMs = 1500,
+  requester = typeof GM_xmlhttpRequest === 'function' ? GM_xmlhttpRequest : null,
+} = {}) {
+  const safePort = normalizePort(port, 0);
+  if (!safePort) {
+    return { state: 'offline', online: false, status: 0, port: 0, reason: 'Số cổng không hợp lệ' };
+  }
+  if (typeof requester !== 'function') {
+    return {
+      state: 'unknown',
+      online: false,
+      status: 0,
+      port: safePort,
+      reason: 'Tampermonkey chưa cấp quyền GM_xmlhttpRequest',
+    };
+  }
+
+  // Luôn chỉ gọi đường dẫn gốc `/` trên loopback 127.0.0.1 — không chạm API Token!
+  const httpUrl = `http://127.0.0.1:${safePort}/`;
+  const httpRes = await runSingleHttpProbe(httpUrl, timeoutMs, requester);
+  if (httpRes.online) {
+    return {
+      state: 'online',
+      online: true,
+      protocol: 'http',
+      port: safePort,
+      status: httpRes.status,
+      latencyMs: httpRes.latencyMs,
+      reason: `Đang chạy (${httpRes.reason}, ${httpRes.latencyMs}ms)`,
+    };
+  }
+
+  if (tryHttpsFallback) {
+    const httpsUrl = `https://127.0.0.1:${safePort}/`;
+    const httpsRes = await runSingleHttpProbe(httpsUrl, timeoutMs, requester);
+    if (httpsRes.online) {
+      return {
+        state: 'online',
+        online: true,
+        protocol: 'https',
+        port: safePort,
+        status: httpsRes.status,
+        latencyMs: httpsRes.latencyMs,
+        reason: `Đang chạy (HTTPS ${httpsRes.status}, ${httpsRes.latencyMs}ms)`,
+      };
+    }
+  }
+
+  return {
+    state: 'offline',
+    online: false,
+    protocol: 'http',
+    port: safePort,
+    status: 0,
+    latencyMs: httpRes.latencyMs,
+    reason: httpRes.reason,
+  };
+}
+
+async function probeAllSigningApps({
+  signingHubPort = DEFAULT_SIGNING_PORTS.signingHub,
+  eSignerPort = DEFAULT_SIGNING_PORTS.eSigner,
+  timeoutMs = 1500,
+  requester,
+} = {}) {
+  const shPort = normalizePort(signingHubPort, DEFAULT_SIGNING_PORTS.signingHub);
+  const esPort = normalizePort(eSignerPort, DEFAULT_SIGNING_PORTS.eSigner);
+
+  const [signingHub, eSigner] = await Promise.all([
+    probeLocalSigningPort({
+      port: shPort,
+      tryHttpsFallback: false,
+      timeoutMs,
+      requester,
+    }),
+    probeLocalSigningPort({
+      port: esPort,
+      tryHttpsFallback: true,
+      timeoutMs,
+      requester,
+    }),
+  ]);
+
+  return {
+    signingHub,
+    eSigner,
+    checkedAt: Date.now(),
+  };
+}
+
+/**
+ * Tổng hợp trạng thái đèn trên Unified Dock theo chế độ theo dõi của từng máy kế toán.
+ */
+function evaluateSigningAggregate({ signingHub, eSigner } = {}, watchTarget = 'any') {
+  const s1 = signingHub?.state || 'unknown';
+  const s2 = eSigner?.state || 'unknown';
+
+  if (watchTarget === 'signinghub') return s1;
+  if (watchTarget === 'esigner') return s2;
+
+  if (watchTarget === 'both') {
+    if (s1 === 'online' && s2 === 'online') return 'online';
+    if (s1 === 'checking' || s2 === 'checking') return 'checking';
+    if (s1 === 'unknown' && s2 === 'unknown') return 'unknown';
+    return 'offline';
+  }
+
+  // Mặc định `'any'`: Xanh khi ít nhất 1 trong 2 phần mềm ký số đang bật
+  if (s1 === 'online' || s2 === 'online') return 'online';
+  if (s1 === 'checking' || s2 === 'checking') return 'checking';
+  if (s1 === 'unknown' && s2 === 'unknown') return 'unknown';
+  return 'offline';
+}
+
+  __exports.probeLocalSigningPort = probeLocalSigningPort;
+  __exports.probeAllSigningApps = probeAllSigningApps;
+  __exports.evaluateSigningAggregate = evaluateSigningAggregate;
+  },
+
+  "features/signing-status/index.js": function(__require, __exports) {
+const { isLoggedIn, DEFAULT_SIGNING_PORTS } = __require("adapters/etax-adapter.js");
+const { STORAGE_KEYS, getValue, setValue } = __require("core/storage.js");
+const { isTopFrame } = __require("core/frame-bus.js");
+const { createDomWatcher } = __require("core/dom-observer.js");
+const { activateDockSlot, deactivateDockSlot, getDockSlotContainer, notifyDockSlotUpdated, toggleDockPopover, openDockPopover, closeDockPopover, getActiveDockPopoverId } = __require("ui/unified-dock.js");
+const { probeAllSigningApps, evaluateSigningAggregate } = __require("features/signing-status/probe.js");
+
+const DEFAULT_SIGNING_CONFIG = {
+  schemaVersion: 1,
+  watchTarget: 'any', // 'any' | 'signinghub' | 'esigner' | 'both'
+  signingHubPort: DEFAULT_SIGNING_PORTS.signingHub,
+  eSignerPort: DEFAULT_SIGNING_PORTS.eSigner,
+};
+
+function loadConfig() {
+  const raw = getValue(STORAGE_KEYS.SIGNING_CONFIG, null);
+  if (!raw || typeof raw !== 'object') return { ...DEFAULT_SIGNING_CONFIG };
+  const validTargets = new Set(['any', 'signinghub', 'esigner', 'both']);
+  return {
+    schemaVersion: 1,
+    watchTarget: validTargets.has(raw.watchTarget) ? raw.watchTarget : 'any',
+    signingHubPort: Number(raw.signingHubPort) || DEFAULT_SIGNING_PORTS.signingHub,
+    eSignerPort: Number(raw.eSignerPort) || DEFAULT_SIGNING_PORTS.eSigner,
+  };
+}
+
+function saveConfig(cfg) {
+  setValue(STORAGE_KEYS.SIGNING_CONFIG, {
+    schemaVersion: 1,
+    watchTarget: cfg.watchTarget,
+    signingHubPort: cfg.signingHubPort,
+    eSignerPort: cfg.eSignerPort,
+  });
+}
+
+function formatTime(ts) {
+  if (!ts) return 'Chưa kiểm tra';
+  const d = new Date(ts);
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}:${String(d.getSeconds()).padStart(2, '0')}`;
+}
+
+function esc(str) {
+  return String(str ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function createSigningStatusFeature() {
+  let active = false;
+  let watcher = null;
+  let initialTimer = null;
+  let hasProbedOnceForLogin = false;
+  let showAdvancedPorts = false;
+
+  let config = loadConfig();
+  let state = {
+    signingHub: { state: 'unknown', port: config.signingHubPort, reason: 'Chưa kiểm tra' },
+    eSigner: { state: 'unknown', port: config.eSignerPort, reason: 'Chưa kiểm tra' },
+    checkedAt: 0,
+  };
+
+  const runProbe = async () => {
+    if (!active) return;
+    state = {
+      signingHub: { state: 'checking', port: config.signingHubPort, reason: 'Đang kiểm tra...' },
+      eSigner: { state: 'checking', port: config.eSignerPort, reason: 'Đang kiểm tra...' },
+      checkedAt: state.checkedAt,
+    };
+    renderSlot();
+    if (getActiveDockPopoverId() === 'signing') {
+      openDockPopover('signing', renderPopover, {
+        maxWidth: '370px',
+        onClose: () => renderSlot(),
+      });
+    }
+
+    const res = await probeAllSigningApps({
+      signingHubPort: config.signingHubPort,
+      eSignerPort: config.eSignerPort,
+    });
+    if (!active) return;
+    state = res;
+    renderSlot();
+
+    if (getActiveDockPopoverId() === 'signing') {
+      openDockPopover('signing', renderPopover, {
+        maxWidth: '370px',
+        onClose: () => renderSlot(),
+      });
+    }
+  };
+
+  const renderPopover = (popEl) => {
+    const agg = evaluateSigningAggregate(state, config.watchTarget);
+    const badgeFor = (s) =>
+      s === 'online'
+        ? '<span class="eh-badge eh-badge-ok">🟢 Đang bật</span>'
+        : s === 'checking'
+          ? '<span class="eh-badge eh-badge-warn">⏳ Đang kiểm tra</span>'
+          : '<span class="eh-badge eh-badge-err">🔴 Chưa bật</span>';
+
+    popEl.innerHTML = `
+      <div class="eh-pop-head">
+        <div class="eh-pop-title">🔏 Trạng thái Phần mềm Ký số</div>
+        <button type="button" class="eh-pop-close" id="eh-sg-close" title="Đóng">×</button>
+      </div>
+
+      <div style="display:flex; flex-direction:column; gap:7px; margin-bottom:10px;">
+        <div style="padding:8px 10px; border:1px solid #e2e8f0; border-radius:8px; background:#f8fafc;">
+          <div style="display:flex; align-items:center; justify-content:space-between; gap:8px;">
+            <strong>CT SigningHub <span class="eh-muted">(:${config.signingHubPort})</span></strong>
+            ${badgeFor(state.signingHub.state)}
+          </div>
+          <div class="eh-muted" style="margin-top:3px; font-size:11.5px;">Dùng cho cổng Dịch vụ công mới · ${esc(state.signingHub.reason)}</div>
+        </div>
+
+        <div style="padding:8px 10px; border:1px solid #e2e8f0; border-radius:8px; background:#f8fafc;">
+          <div style="display:flex; align-items:center; justify-content:space-between; gap:8px;">
+            <strong>eSigner Java <span class="eh-muted">(:${config.eSignerPort})</span></strong>
+            ${badgeFor(state.eSigner.state)}
+          </div>
+          <div class="eh-muted" style="margin-top:3px; font-size:11.5px;">Dùng cho iframe Thuế điện tử (GNT/XML) · ${esc(state.eSigner.reason)}</div>
+        </div>
+      </div>
+
+      <div style="margin-bottom:9px;">
+        <label for="eh-sg-target" style="display:block; font-size:11.5px; font-weight:600; color:#475569; margin-bottom:4px;">
+          Quy tắc báo đèn trên máy này:
+        </label>
+        <select class="eh-select" id="eh-sg-target" style="font-size:12px;">
+          <option value="any" ${config.watchTarget === 'any' ? 'selected' : ''}>Xanh khi ít nhất 1 trong 2 app đang bật (Mặc định)</option>
+          <option value="signinghub" ${config.watchTarget === 'signinghub' ? 'selected' : ''}>Chỉ theo dõi CT SigningHub</option>
+          <option value="esigner" ${config.watchTarget === 'esigner' ? 'selected' : ''}>Chỉ theo dõi eSigner Java</option>
+          <option value="both" ${config.watchTarget === 'both' ? 'selected' : ''}>Yêu cầu CẢ HAI app cùng bật</option>
+        </select>
+      </div>
+
+      <div style="display:flex; align-items:center; justify-content:space-between; gap:8px; flex-wrap:wrap;">
+        <span class="eh-muted" style="font-size:11.5px;">Kiểm tra lúc: ${esc(formatTime(state.checkedAt))}</span>
+        <div style="display:flex; gap:6px;">
+          <button type="button" class="eh-btn eh-btn-sm" id="eh-sg-ports-toggle">${showAdvancedPorts ? 'Ẩn cổng' : '⚙️ Cổng'}</button>
+          <button type="button" class="eh-btn eh-btn-primary eh-btn-sm" id="eh-sg-recheck">🔄 Kiểm tra lại</button>
+        </div>
+      </div>
+
+      ${
+        showAdvancedPorts
+          ? `
+        <div style="margin-top:9px; padding-top:8px; border-top:1px solid #e2e8f0; display:flex; align-items:flex-end; gap:6px;">
+          <div style="flex:1;">
+            <label style="font-size:11px; color:#64748b;">Cổng SigningHub</label>
+            <input type="number" class="eh-input" id="eh-sg-port-sh" value="${config.signingHubPort}" style="padding:4px 6px; font-size:12px;"/>
+          </div>
+          <div style="flex:1;">
+            <label style="font-size:11px; color:#64748b;">Cổng eSigner</label>
+            <input type="number" class="eh-input" id="eh-sg-port-es" value="${config.eSignerPort}" style="padding:4px 6px; font-size:12px;"/>
+          </div>
+          <button type="button" class="eh-btn eh-btn-sm" id="eh-sg-ports-save">Lưu</button>
+        </div>
+      `
+          : ''
+      }
+
+      ${
+        agg === 'offline'
+          ? '<div class="eh-warning" style="margin-top:9px;">⚠️ Chưa phát hiện phần mềm ký số đang chạy. Hãy mở ứng dụng ký số trên Windows rồi bấm <strong>Kiểm tra lại</strong> trước khi trình ký.</div>'
+          : ''
+      }
+    `;
+
+    popEl.querySelector('#eh-sg-close')?.addEventListener('click', () => closeDockPopover('signing'));
+    popEl.querySelector('#eh-sg-recheck')?.addEventListener('click', () => {
+      void runProbe();
+    });
+    popEl.querySelector('#eh-sg-target')?.addEventListener('change', (e) => {
+      config.watchTarget = e.target.value;
+      saveConfig(config);
+      renderSlot();
+      renderPopover(popEl);
+    });
+    popEl.querySelector('#eh-sg-ports-toggle')?.addEventListener('click', () => {
+      showAdvancedPorts = !showAdvancedPorts;
+      renderPopover(popEl);
+    });
+    popEl.querySelector('#eh-sg-ports-save')?.addEventListener('click', () => {
+      const sh = parseInt(popEl.querySelector('#eh-sg-port-sh')?.value || '', 10);
+      const es = parseInt(popEl.querySelector('#eh-sg-port-es')?.value || '', 10);
+      if (sh >= 1 && sh <= 65535) config.signingHubPort = sh;
+      if (es >= 1 && es <= 65535) config.eSignerPort = es;
+      saveConfig(config);
+      showAdvancedPorts = false;
+      void runProbe();
+    });
+  };
+
+  const renderSlot = () => {
+    if (!active) return;
+    if (!isLoggedIn(document, location)) {
+      deactivateDockSlot('signing');
+      return;
+    }
+
+    const slot = getDockSlotContainer('signing') || activateDockSlot('signing');
+    if (!slot) return;
+
+    const agg = evaluateSigningAggregate(state, config.watchTarget);
+    const popOpen = getActiveDockPopoverId() === 'signing';
+    const textLabel =
+      agg === 'online'
+        ? 'Ký số'
+        : agg === 'checking'
+          ? 'Đang dò...'
+          : agg === 'offline'
+            ? 'Chưa bật ký số'
+            : 'Ký số';
+
+    const titleText =
+      `CT SigningHub (:${config.signingHubPort}): ${state.signingHub.state === 'online' ? 'Đang bật' : 'Chưa bật'}\n` +
+      `eSigner Java (:${config.eSignerPort}): ${state.eSigner.state === 'online' ? 'Đang bật' : 'Chưa bật'}\n` +
+      'Bấm để xem chi tiết hoặc Kiểm tra lại.';
+
+    slot.innerHTML = `
+      <button type="button" class="eh-dock-chip ${popOpen ? 'active' : ''}" id="eh-sg-btn" title="${esc(titleText)}">
+        <span class="eh-sign-dot ${agg}"></span>
+        <span class="eh-hide-collapsed" style="${agg === 'offline' ? 'color:#dc2626;' : ''}">${textLabel}</span>
+      </button>
+    `;
+
+    slot.querySelector('#eh-sg-btn')?.addEventListener('click', () => {
+      toggleDockPopover('signing', renderPopover, {
+        maxWidth: '370px',
+        onClose: () => renderSlot(),
+      });
+      renderSlot();
+    });
+    notifyDockSlotUpdated('signing');
+  };
+
+  const syncLoginAndCheckOnce = () => {
+    if (!active) return;
+    const logged = isLoggedIn(document, location);
+    if (!logged) {
+      hasProbedOnceForLogin = false;
+      deactivateDockSlot('signing');
+      return;
+    }
+
+    renderSlot();
+    if (!hasProbedOnceForLogin) {
+      hasProbedOnceForLogin = true;
+      if (initialTimer) clearTimeout(initialTimer);
+      initialTimer = setTimeout(() => {
+        initialTimer = null;
+        void runProbe();
+      }, 800);
+    }
+  };
+
+  return {
+    start() {
+      if (!isTopFrame()) return;
+      active = true;
+      config = loadConfig();
+      watcher = createDomWatcher(syncLoginAndCheckOnce, { debounceMs: 250 });
+      watcher.start();
+    },
+
+    stop() {
+      active = false;
+      hasProbedOnceForLogin = false;
+      if (initialTimer) {
+        clearTimeout(initialTimer);
+        initialTimer = null;
+      }
+      if (watcher) {
+        watcher.stop();
+        watcher = null;
+      }
+      closeDockPopover('signing');
+      deactivateDockSlot('signing');
+    },
+  };
+}
+
+  __exports.createSigningStatusFeature = createSigningStatusFeature;
+  },
+
   "main.js": function(__require, __exports) {
 const { getSettings, onSettingsChange, registerTampermonkeyMenu } = __require("core/settings.js");
 const { isTopFrame } = __require("core/frame-bus.js");
@@ -5069,11 +9498,15 @@ const { createQuickLoginFeature } = __require("features/quick-login/index.js");
 const { createDatePresetsFeature } = __require("features/date-presets/index.js");
 const { createTableEnhancerFeature } = __require("features/table-enhancer/index.js");
 const { createSessionTimerFeature } = __require("features/session-timer/index.js");
+const { createCompanyBarFeature } = __require("features/company-bar/index.js");
+const { createTaxCodeHelperFeature } = __require("features/tax-code-helper/index.js");
+const { createQuickAccessFeature } = __require("features/quick-access/index.js");
+const { createSigningStatusFeature } = __require("features/signing-status/index.js");
 
 /**
- * Điểm khởi chạy chính của eTax Helper:
+ * Điểm khởi chạy chính của eTax Helper v2.0:
  * 1. Gắn ngay network-probe tại document-start để không bỏ sót bất kỳ request XHR/HTMX/Fetch nào.
- * 2. Chờ DOMContentLoaded để khởi tạo Menu Tampermonkey (chỉ ở Top-Frame) và bật/tắt 4 tính năng theo cài đặt từng máy.
+ * 2. Chờ DOMContentLoaded để khởi tạo Menu Tampermonkey (chỉ ở Top-Frame) và bật/tắt độc lập 8 tính năng.
  */
 
 // Bước 1: Gắn cảm biến mạng ngay ở document-start
@@ -5085,6 +9518,10 @@ function bootstrapUi() {
     datePresets: createDatePresetsFeature(),
     tableEnhancer: createTableEnhancerFeature(),
     sessionTimer: createSessionTimerFeature(),
+    companyBar: createCompanyBarFeature(),
+    taxCodeHelper: createTaxCodeHelperFeature(),
+    quickAccess: createQuickAccessFeature(),
+    signingStatus: createSigningStatusFeature(),
   };
 
   const activeFlags = {
@@ -5092,6 +9529,10 @@ function bootstrapUi() {
     datePresets: false,
     tableEnhancer: false,
     sessionTimer: false,
+    companyBar: false,
+    taxCodeHelper: false,
+    quickAccess: false,
+    signingStatus: false,
   };
 
   const applySettings = (settings) => {
@@ -5107,7 +9548,8 @@ function bootstrapUi() {
     }
   };
 
-  if (isTopFrame()) {
+  const refreshMenu = () => {
+    if (!isTopFrame()) return;
     registerTampermonkeyMenu({
       onLockVaultNow() {
         lockSessionNow();
@@ -5117,22 +9559,13 @@ function bootstrapUi() {
         applySettings(updated);
       },
     });
-  }
+  };
 
+  refreshMenu();
   applySettings(getSettings());
   onSettingsChange((nextSettings) => {
     applySettings(nextSettings);
-    if (isTopFrame()) {
-      registerTampermonkeyMenu({
-        onLockVaultNow() {
-          lockSessionNow();
-          window.alert('Đã khóa danh sách MST & xóa phiên mã PIN.');
-        },
-        onSettingsToggled(updated) {
-          applySettings(updated);
-        },
-      });
-    }
+    refreshMenu();
   });
 }
 
