@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         eTax Helper Internal
 // @namespace    https://etax-helper.internal/userscript
-// @version      2.0.1
+// @version      2.0.2
 // @description  Hỗ trợ nghiệp vụ kế toán nội bộ trên Cổng Dịch vụ công Thuế & eTax (MST mã hóa PIN, Chọn ngày 2 cấp, Mở rộng bảng, Đồng hồ giữ phiên, Unified Dock định danh & Ghi chú, Trợ lý MC/TM & đối soát Xanh/Đỏ, Truy cập nhanh & Ghim tờ khai, Trạng thái CT SigningHub & eSigner)
 // @author       Internal Accounting Tech Team
 // @match        https://dichvucong.gdt.gov.vn/*

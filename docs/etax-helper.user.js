@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         eTax Helper Internal
 // @namespace    https://etax-helper.internal/userscript
-// @version      2.0.1
+// @version      2.0.2
 // @description  Hỗ trợ nghiệp vụ kế toán nội bộ trên Cổng Dịch vụ công Thuế & eTax (MST mã hóa PIN, Chọn ngày 2 cấp, Mở rộng bảng, Đồng hồ giữ phiên, Unified Dock định danh & Ghi chú, Trợ lý MC/TM & đối soát Xanh/Đỏ, Truy cập nhanh & Ghim tờ khai, Trạng thái CT SigningHub & eSigner)
 // @author       Internal Accounting Tech Team
 // @match        https://dichvucong.gdt.gov.vn/*
@@ -4261,8 +4261,8 @@ function createInitialDateState() {
  *  - Chọn Tháng trong lúc đang chọn Quý → giữ Quý nếu Tháng thuộc Quý đó.
  *  - Chọn Chọn nhanh → lưu quickPreset và xóa 3 dropdown cấp lớn để tránh mâu thuẫn hiển thị.
  */
-function reduceDateState(prevState, action, now = new Date()) {
-  const currentYear = now.getFullYear();
+function reduceDateState(prevState, action, now = new Date(), options = {}) {
+  const defaultYear = Number(options.fallbackYear) || now.getFullYear();
   const next = { ...prevState };
 
   if (action.type === 'RESET') {
@@ -4285,7 +4285,7 @@ function reduceDateState(prevState, action, now = new Date()) {
     next.quarter = val;
     next.quickPreset = null;
     if (val) {
-      if (!next.year) next.year = currentYear;
+      if (!next.year) next.year = defaultYear;
       // Khi người dùng chủ động chọn (hoặc đổi) Quý, xóa Tháng cũ để áp dụng trọn Quý
       next.month = null;
     }
@@ -4297,7 +4297,7 @@ function reduceDateState(prevState, action, now = new Date()) {
     next.month = val;
     next.quickPreset = null;
     if (val) {
-      if (!next.year) next.year = currentYear;
+      if (!next.year) next.year = defaultYear;
       if (next.quarter && !getAvailableMonths(next.quarter).includes(val)) {
         next.quarter = null;
       }
@@ -4339,18 +4339,37 @@ function resolveDateRange(state, now = new Date()) {
 
 /**
  * Tính kết quả cần điền vào 2 ô input theo chế độ ('range' hoặc 'end_only').
+ * Hỗ trợ `clampToToday` để tránh bị cổng thuế (`changeDate(this, true)` / `compareNowDateTime`)
+ * xóa trắng hoặc báo lỗi khi ngày cuối kỳ (VD: 30/11/2026) lớn hơn ngày hiện tại (VD: 23/11/2026).
  */
-function computeFieldApplication(state, { mode = 'range', existingFromStr = '', now = new Date() } = {}) {
+function computeFieldApplication(
+  state,
+  { mode = 'range', existingFromStr = '', now = new Date(), clampToToday = false } = {},
+) {
   const range = resolveDateRange(state, now);
   if (!range) return null;
 
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const originalToStr = formatDateDDMMYYYY(range.toDate);
+
+  let effectiveToDate = range.toDate;
+  let wasClampedToToday = false;
+
+  if (clampToToday && range.toDate.getTime() > today.getTime()) {
+    const startRef = mode === 'end_only' ? parseDateDDMMYYYY(existingFromStr) : range.fromDate;
+    if (!startRef || startRef.getTime() <= today.getTime()) {
+      effectiveToDate = today;
+      wasClampedToToday = true;
+    }
+  }
+
   const computedFromStr = formatDateDDMMYYYY(range.fromDate);
-  const computedToStr = formatDateDDMMYYYY(range.toDate);
+  const computedToStr = formatDateDDMMYYYY(effectiveToDate);
 
   if (mode === 'end_only') {
     const existingFromDate = parseDateDDMMYYYY(existingFromStr);
     const isEndBeforeStart = Boolean(
-      existingFromDate && range.toDate.getTime() < existingFromDate.getTime(),
+      existingFromDate && effectiveToDate.getTime() < existingFromDate.getTime(),
     );
     return {
       mode: 'end_only',
@@ -4358,6 +4377,9 @@ function computeFieldApplication(state, { mode = 'range', existingFromStr = '', 
       shouldUpdateTo: true,
       fromStr: existingFromStr,
       toStr: computedToStr,
+      originalToStr,
+      wasClampedToToday,
+      isFutureToDate: effectiveToDate.getTime() > today.getTime(),
       isEndBeforeStart,
     };
   }
@@ -4368,6 +4390,9 @@ function computeFieldApplication(state, { mode = 'range', existingFromStr = '', 
     shouldUpdateTo: true,
     fromStr: computedFromStr,
     toStr: computedToStr,
+    originalToStr,
+    wasClampedToToday,
+    isFutureToDate: effectiveToDate.getTime() > today.getTime(),
     isEndBeforeStart: false,
   };
 }
@@ -4390,13 +4415,13 @@ function computeFieldApplication(state, { mode = 'range', existingFromStr = '', 
 
   "features/date-presets/popover-ui.js": function(__require, __exports) {
 const { createShadowMount } = __require("ui/shadow-host.js");
-const { QUICK_PRESETS, getAvailableMonths, createInitialDateState, reduceDateState, computeFieldApplication } = __require("features/date-presets/date-engine.js");
+const { QUICK_PRESETS, getAvailableMonths, createInitialDateState, reduceDateState, computeFieldApplication, parseDateDDMMYYYY, formatDateDDMMYYYY } = __require("features/date-presets/date-engine.js");
 
 const POPOVER_CSS = `
 .eh-pop {
   position: fixed;
   z-index: 2147483635;
-  width: 332px;
+  width: 344px;
   background: #ffffff;
   border: 1px solid #d4dbe5;
   border-radius: 10px;
@@ -4460,6 +4485,26 @@ const POPOVER_CSS = `
   background: #e2e8f0;
   color: #475569;
 }
+.eh-clamp-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11.5px;
+  color: #334155;
+  margin: 6px 0 4px;
+  cursor: pointer;
+  user-select: none;
+}
+.eh-info-note {
+  margin-top: 6px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: #eff8ff;
+  border: 1px solid #bae0ff;
+  color: #005a99;
+  font-size: 11.5px;
+  line-height: 1.4;
+}
 .eh-pop-foot {
   display: flex;
   justify-content: space-between;
@@ -4474,7 +4519,7 @@ function createDatePopoverController() {
   let host = null;
   let root = null;
   let cleanupMount = null;
-  let activeSession = null; // { anchorEl, mode, state, getFromVal, getToVal, onApply }
+  let activeSession = null; // { anchorEl, mode, state, clampToToday, lastApplyNotice, getFromVal, getToVal, onApply }
 
   const close = () => {
     activeSession = null;
@@ -4495,8 +4540,11 @@ function createDatePopoverController() {
 
   const onOutsideClick = (e) => {
     if (!host) return;
-    if (host.contains(e.target)) return;
-    if (activeSession?.anchorEl && activeSession.anchorEl.contains(e.target)) return;
+    const path = typeof e.composedPath === 'function' ? e.composedPath() : [];
+    if (path.includes(host) || host.contains(e.target)) return;
+    if (activeSession?.anchorEl && (path.includes(activeSession.anchorEl) || activeSession.anchorEl.contains(e.target))) {
+      return;
+    }
     close();
   };
 
@@ -4533,8 +4581,9 @@ function createDatePopoverController() {
 
   const render = () => {
     if (!root || !activeSession) return;
-    const { mode, state, getFromVal, getToVal } = activeSession;
+    const { mode, state, clampToToday, lastApplyNotice, getFromVal, getToVal } = activeSession;
     const now = new Date();
+    const todayStr = formatDateDDMMYYYY(now);
     const currentYear = now.getFullYear();
     const years = [];
     for (let y = currentYear + 1; y >= currentYear - 10; y--) {
@@ -4548,10 +4597,22 @@ function createDatePopoverController() {
       mode,
       existingFromStr: existingFrom,
       now,
+      clampToToday,
     });
 
-    const previewFrom = mode === 'end_only' ? existingFrom || 'dd/mm/yyyy' : applied?.fromStr || existingFrom || 'dd/mm/yyyy';
-    const previewTo = applied?.toStr || existingTo || 'dd/mm/yyyy';
+    // Luôn hiển thị giá trị THỰC TẾ trong ô DOM sau khi áp dụng (tránh báo ảo nếu cổng thuế từ chối/điều chỉnh)
+    const previewFrom =
+      mode === 'end_only'
+        ? existingFrom || 'dd/mm/yyyy'
+        : existingFrom || applied?.fromStr || 'dd/mm/yyyy';
+    const previewTo = existingTo || applied?.toStr || 'dd/mm/yyyy';
+
+    let infoNoteHtml = '';
+    if (lastApplyNotice) {
+      infoNoteHtml = `<div class="${lastApplyNotice.type === 'warn' ? 'eh-warning' : 'eh-info-note'}">${lastApplyNotice.text}</div>`;
+    } else if (applied?.wasClampedToToday) {
+      infoNoteHtml = `<div class="eh-info-note">ℹ️ Ngày cuối kỳ (${applied.originalToStr}) lớn hơn hôm nay → đã tự giới hạn về <strong>${applied.toStr}</strong> để cổng thuế không xóa trắng.</div>`;
+    }
 
     root.innerHTML = `
       <div class="eh-pop">
@@ -4610,11 +4671,18 @@ function createDatePopoverController() {
           </div>
         </div>
 
+        <label class="eh-clamp-row" title="Cổng Dịch vụ công và eTax thường chặn hoặc xóa trắng ngày lớn hơn ngày hiện tại">
+          <input type="checkbox" id="eh-dp-clamp-today" ${clampToToday ? 'checked' : ''}/>
+          <span>Tự giới hạn Đến ngày ≤ Hôm nay (${todayStr})</span>
+        </label>
+
         ${
           applied?.isEndBeforeStart
             ? '<div class="eh-warning" style="margin-top:4px;">⚠️ Lưu ý: "Đến ngày" vừa chọn đang nhỏ hơn "Từ ngày" hiện tại.</div>'
             : ''
         }
+
+        ${infoNoteHtml}
 
         <div class="eh-pop-foot">
           <button type="button" class="eh-btn eh-btn-sm" id="eh-dp-reset">Xóa chọn</button>
@@ -4624,17 +4692,37 @@ function createDatePopoverController() {
       </div>
     `;
 
-    const dispatchAction = (action) => {
-      activeSession.state = reduceDateState(activeSession.state, action, new Date());
+    const applyCurrentState = () => {
+      const nowInner = new Date();
       const res = computeFieldApplication(activeSession.state, {
         mode: activeSession.mode,
         existingFromStr: activeSession.getFromVal() || '',
-        now: new Date(),
+        now: nowInner,
+        clampToToday: activeSession.clampToToday,
       });
+      activeSession.lastApplyNotice = null;
       if (res) {
-        activeSession.onApply(res);
+        const applyOutcome = activeSession.onApply(res);
+        if (applyOutcome && applyOutcome.notice) {
+          activeSession.lastApplyNotice = applyOutcome.notice;
+        }
       }
       render();
+    };
+
+    const dispatchAction = (action) => {
+      const nowInner = new Date();
+      // Ở chế độ END_ONLY, nếu Từ ngày đang ở năm cũ (VD 01/10/2025) mà kế toán chọn Tháng 11,
+      // tự kế thừa năm 2025 thay vì nhảy sang năm hiện tại!
+      let fallbackYear = nowInner.getFullYear();
+      if (activeSession.mode === 'end_only') {
+        const fromDate = parseDateDDMMYYYY(activeSession.getFromVal() || '');
+        if (fromDate) fallbackYear = fromDate.getFullYear();
+      }
+      activeSession.state = reduceDateState(activeSession.state, action, nowInner, {
+        fallbackYear,
+      });
+      applyCurrentState();
     };
 
     root.querySelector('#eh-dp-year')?.addEventListener('change', (e) => {
@@ -4649,8 +4737,13 @@ function createDatePopoverController() {
     root.querySelector('#eh-dp-quick')?.addEventListener('change', (e) => {
       dispatchAction({ type: 'SET_QUICK_PRESET', value: e.target.value });
     });
+    root.querySelector('#eh-dp-clamp-today')?.addEventListener('change', (e) => {
+      activeSession.clampToToday = Boolean(e.target.checked);
+      applyCurrentState();
+    });
     root.querySelector('#eh-dp-reset')?.addEventListener('click', () => {
       activeSession.state = createInitialDateState();
+      activeSession.lastApplyNotice = null;
       render();
     });
     root.querySelector('#eh-dp-close')?.addEventListener('click', close);
@@ -4659,7 +4752,7 @@ function createDatePopoverController() {
   };
 
   return {
-    open({ anchorEl, mode = 'range', getFromVal, getToVal, onApply }) {
+    open({ anchorEl, mode = 'range', defaultClampToToday = false, getFromVal, getToVal, onApply }) {
       // Nếu bấm lại đúng nút đang mở thì đóng lại cho tiện tay
       if (activeSession && activeSession.anchorEl === anchorEl) {
         close();
@@ -4671,6 +4764,8 @@ function createDatePopoverController() {
         anchorEl,
         mode,
         state: createInitialDateState(),
+        clampToToday: Boolean(defaultClampToToday),
+        lastApplyNotice: null,
         getFromVal,
         getToVal,
         onApply,
@@ -4705,6 +4800,7 @@ function createDatePopoverController() {
 const { findDateInputPairs, setNativeInputValue } = __require("adapters/etax-adapter.js");
 const { createDomWatcher } = __require("core/dom-observer.js");
 const { createDatePopoverController } = __require("features/date-presets/popover-ui.js");
+const { formatDateDDMMYYYY, parseDateDDMMYYYY } = __require("features/date-presets/date-engine.js");
 
 const STYLE_ID = 'etax-helper-date-trigger-css';
 
@@ -4748,6 +4844,58 @@ const TRIGGER_CSS = `
 }
 `;
 
+function getPageWindow() {
+  try {
+    return typeof unsafeWindow !== 'undefined' && unsafeWindow ? unsafeWindow : window;
+  } catch {
+    return window;
+  }
+}
+
+/**
+ * Kiểm tra ô ngày trên cổng thuế có gắn cơ chế chặn ngày lớn hơn Hôm nay hay không:
+ * - Cổng mới dichvucong (`/tthc/tchs`): `onchange="changeDate(this, true)"`
+ * - Iframe eTax thuedientu (`module=360103`): `onchange="compareNowDateTime(this,'Đến ngày')"`
+ */
+function isFutureDateRestricted(input) {
+  if (!input) return false;
+  const onchange = String(input.getAttribute('onchange') || '');
+  const onblur = String(input.getAttribute('onblur') || '');
+  if (/changeDate\s*\([^)]*,\s*true\s*\)/i.test(onchange)) return true;
+  if (/compareNowDateTime/i.test(onchange) || /compareNowDateTime/i.test(onblur)) return true;
+  return false;
+}
+
+/**
+ * Đồng bộ trạng thái nội bộ của các thư viện lịch (Flatpickr / Bootstrap Datepicker / jQuery UI Datepicker)
+ * nếu có gắn trên input, đồng thời đảm bảo giữ đúng chuỗi `DD/MM/YYYY` nếu widget định dạng sai hoặc xóa mất.
+ */
+function syncCalendarWidgetSafe(input, targetStr) {
+  if (!input || !targetStr) return;
+  try {
+    if (input._flatpickr && typeof input._flatpickr.setDate === 'function') {
+      input._flatpickr.setDate(targetStr, false, 'd/m/Y');
+    } else {
+      const pw = getPageWindow();
+      if (pw.jQuery) {
+        const $el = pw.jQuery(input);
+        if (typeof $el.datepicker === 'function') {
+          if ($el.data('datepicker')) {
+            // Bootstrap Datepicker (hay dùng trên dichvucong one-calendar)
+            $el.datepicker('update', targetStr);
+          } else if (input.classList.contains('hasDatepicker')) {
+            // jQuery UI Datepicker (dùng trong iframe thuedientu)
+            const d = parseDateDDMMYYYY(targetStr);
+            if (d) $el.datepicker('setDate', d);
+          }
+        }
+      }
+    }
+  } catch {
+    // Bỏ qua an toàn nếu widget dùng API khác
+  }
+}
+
 function createDatePresetsFeature() {
   let watcher = null;
   let styleEl = null;
@@ -4780,10 +4928,26 @@ function createDatePresetsFeature() {
 
   const attachTriggerForInput = (input, button, kind) => {
     if (kind === 'dvc-one-calendar') {
-      // Trên dichvucong (Bootstrap 5), input có label phía trên: đặt nút gọn ngay cạnh <label>
+      // Trên dichvucong (Bootstrap 5), input có label phía trên: ưu tiên đúng label[for=id] hoặc label cùng cột chưa gắn nút
       const col = input.closest('.col-md-6, .col, .form-group') || input.parentElement;
-      const label = col?.querySelector(`label[for="${input.id}"], label`);
-      if (label && label.parentElement) {
+      let label = null;
+      if (input.id && col) {
+        try {
+          label = col.querySelector(`label[for="${CSS.escape(input.id)}"]`);
+        } catch {
+          label = col.querySelector(`label[for="${input.id}"]`);
+        }
+      }
+      if (!label && input.previousElementSibling?.tagName === 'LABEL') {
+        label = input.previousElementSibling;
+      }
+      if (!label && col) {
+        const candidate = col.querySelector('label');
+        if (candidate && !candidate.querySelector('[data-etax-date-trigger]')) {
+          label = candidate;
+        }
+      }
+      if (label && label.parentElement && !label.querySelector('[data-etax-date-trigger]')) {
         label.appendChild(button);
         return;
       }
@@ -4805,15 +4969,44 @@ function createDatePresetsFeature() {
     fromInput.setAttribute('data-etax-date-bound', '1');
     toInput.setAttribute('data-etax-date-bound', '1');
 
+    const writeAndNotify = (input, dateStr) => {
+      setNativeInputValue(input, dateStr, {
+        triggerInput: false,
+        triggerChange: false,
+        triggerBlur: false,
+      });
+      syncCalendarWidgetSafe(input, dateStr);
+      // Nếu widget lịch không nhận chuỗi (VD do vượt endDate của bootstrap-datepicker) thì khôi phục trước khi bắn change
+      if (input.value !== dateStr) {
+        setNativeInputValue(input, dateStr, {
+          triggerInput: false,
+          triggerChange: false,
+          triggerBlur: false,
+        });
+      }
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+    };
+
     const applyResult = (res) => {
+      const prevToVal = toInput.value || '';
+
       // Ghi đồng thời cả 2 giá trị trước khi bắn sự kiện input/change để tránh trạng thái trung gian Từ ngày > Đến ngày.
-      // Tuyệt đối KHÔNG bắn sự kiện `blur` giả trên iframe eTax (tránh vòng lặp onblur CheckDate/_checkDate -> focus() làm nhấp nháy 2 ô).
+      // Tuyệt đối KHÔNG bắn sự kiện `blur` giả trên iframe eTax (tránh vòng lặp onblur CheckDate/_checkDate -> focus()).
       if (res.shouldUpdateFrom && res.fromStr) {
         setNativeInputValue(fromInput, res.fromStr, {
           triggerInput: false,
           triggerChange: false,
           triggerBlur: false,
         });
+        syncCalendarWidgetSafe(fromInput, res.fromStr);
+        if (fromInput.value !== res.fromStr) {
+          setNativeInputValue(fromInput, res.fromStr, {
+            triggerInput: false,
+            triggerChange: false,
+            triggerBlur: false,
+          });
+        }
       }
       if (res.shouldUpdateTo && res.toStr) {
         setNativeInputValue(toInput, res.toStr, {
@@ -4821,6 +5014,14 @@ function createDatePresetsFeature() {
           triggerChange: false,
           triggerBlur: false,
         });
+        syncCalendarWidgetSafe(toInput, res.toStr);
+        if (toInput.value !== res.toStr) {
+          setNativeInputValue(toInput, res.toStr, {
+            triggerInput: false,
+            triggerChange: false,
+            triggerBlur: false,
+          });
+        }
       }
 
       if (res.shouldUpdateFrom && res.fromStr) {
@@ -4830,8 +5031,49 @@ function createDatePresetsFeature() {
       if (res.shouldUpdateTo && res.toStr) {
         toInput.dispatchEvent(new Event('input', { bubbles: true }));
         toInput.dispatchEvent(new Event('change', { bubbles: true }));
+
+        // Kiểm chứng hậu điền: nếu cổng thuế vừa xóa trắng/từ chối `toInput` do ngày > Hôm nay
+        // (VD: chọn Tháng 11 -> 30/11 khi hôm nay mới là 23/11), tự động điều chỉnh về Hôm nay để không mất dữ liệu!
+        const rejectedByPortal =
+          !toInput.value ||
+          (toInput.value !== res.toStr && toInput.value === prevToVal) ||
+          toInput.classList.contains('is-invalid');
+
+        if (rejectedByPortal && res.isFutureToDate) {
+          const todayStr = formatDateDDMMYYYY(new Date());
+          writeAndNotify(toInput, todayStr);
+          if (toInput.value === todayStr) {
+            return {
+              notice: {
+                type: 'info',
+                text: `ℹ️ Cổng thuế không cho chọn ngày tương lai (${res.toStr}) → đã tự điều chỉnh Đến ngày về <strong>Hôm nay (${todayStr})</strong>.`,
+              },
+            };
+          }
+        }
+
+        if (toInput.value !== res.toStr) {
+          // Trường hợp thư viện lịch tự đổi lại giá trị cũ: ép lại lần cuối không gây lặp
+          setNativeInputValue(toInput, res.toStr, {
+            triggerInput: true,
+            triggerChange: false,
+            triggerBlur: false,
+          });
+          if (toInput.value !== res.toStr) {
+            return {
+              notice: {
+                type: 'warn',
+                text: `⚠️ Cổng thuế không chấp nhận ngày ${res.toStr} (ô hiện tại: ${toInput.value || 'trống'}).`,
+              },
+            };
+          }
+        }
       }
+
+      return null;
     };
+
+    const restrictFuture = isFutureDateRestricted(toInput) || isFutureDateRestricted(fromInput);
 
     const rangeBtn = makeTriggerButton(
       '📅 Kỳ',
@@ -4841,6 +5083,7 @@ function createDatePresetsFeature() {
         popover.open({
           anchorEl,
           mode: 'range',
+          defaultClampToToday: restrictFuture,
           getFromVal: () => fromInput.value,
           getToVal: () => toInput.value,
           onApply: applyResult,
@@ -4856,6 +5099,7 @@ function createDatePresetsFeature() {
         popover.open({
           anchorEl,
           mode: 'end_only',
+          defaultClampToToday: restrictFuture,
           getFromVal: () => fromInput.value,
           getToVal: () => toInput.value,
           onApply: applyResult,
@@ -4916,6 +5160,8 @@ const STYLE_ID = 'etax-helper-table-enhancer-css';
  * - Giữ nguyên độ rộng gọn gàng của form lọc `form#form-search-advanced.container`.
  * - Mở rộng tối đa chiều ngang khung bảng kết quả `#table-container` bên dưới.
  * - Nén các cột `min-width` quá khổ (600px/250px/200px) + bật word-wrap chống kéo thanh cuộn ngang.
+ * - Tương phản cao chuẩn WCAG AAA (>7.3:1): Tiêu đề nền xanh đậm (#005b9e) + chữ trắng sắc nét (#ffffff),
+ *   thân bảng chữ đen đậm (#0f172a) trên nền trắng/xám xanh dịu mắt (#f4f8fc).
  * - Chỉ cố định dòng tiêu đề `thead` (KHÔNG cố định cột trái).
  */
 const DVC_TABLE_CSS = `
@@ -4939,8 +5185,9 @@ html, body {
   width: 100% !important;
   max-height: 72vh !important;
   overflow: auto !important;
-  border: 1px solid #dee2e6;
+  border: 1px solid #b8cde0;
   border-radius: 6px;
+  background: #ffffff;
 }
 #table-container table.table {
   width: 100% !important;
@@ -4948,34 +5195,59 @@ html, body {
   border-collapse: separate;
   border-spacing: 0;
 }
-#table-container table.table thead {
+#table-container table.table thead,
+#bangKetQuaTTHC table.table thead {
   position: sticky !important;
   top: 0 !important;
   z-index: 6 !important;
 }
-#table-container table.table thead th {
-  position: sticky !important;
-  top: 0 !important;
-  z-index: 6 !important;
-  background-color: #cfe2ff !important;
+#table-container table.table thead th,
+#table-container table.table thead td,
+#bangKetQuaTTHC table.table thead th,
+#bangKetQuaTTHC table.table thead td {
+  background-color: #005b9e !important;
+  background-image: none !important;
+  color: #ffffff !important;
+  font-weight: 600 !important;
+  border-color: rgba(255, 255, 255, 0.25) !important;
   white-space: normal !important;
   word-wrap: break-word !important;
   overflow-wrap: break-word !important;
-  box-shadow: inset 0 -1px 0 #9ec5fe;
+  box-shadow: inset 0 -2px 0 #003f70;
 }
-#table-container table.table td {
+#table-container table.table thead th *,
+#table-container table.table thead td *,
+#bangKetQuaTTHC table.table thead th *,
+#bangKetQuaTTHC table.table thead td * {
+  color: #ffffff !important;
+}
+#table-container table.table tbody td,
+#bangKetQuaTTHC table.table tbody td {
+  color: #0f172a !important;
+  border-color: #d5e0ea !important;
   white-space: normal !important;
   word-wrap: break-word !important;
   overflow-wrap: break-word !important;
   vertical-align: middle;
 }
+#table-container table.table tbody tr:nth-child(even) td {
+  background-color: #f4f8fc !important;
+}
+#table-container table.table tbody tr:hover td {
+  background-color: #e6f2ff !important;
+}
+#table-container table.table tbody td a:not(.btn) {
+  color: #005599 !important;
+  font-weight: 500;
+}
 `;
 
 /**
  * CSS cho Iframe eTax cổ điển (thuedientu.gdt.gov.vn/etaxnnt/* — F12 Mẫu 2):
- * - Giữ nguyên phần form lọc phía trên ở bố cục gọn gàng.
- * - Mở rộng tối đa `.tab-content` / `.tbody_scroll` bên dưới và gỡ bỏ thuộc tính `width="230%"` trên `table.result_table`.
- * - Hỗ trợ sticky header cho CẢ `thead th` VÀ `thead td` (vì eTax dùng `<thead><tr class="result_head"><td>`).
+ * - Mở rộng tối đa `.tab-content` / `.tbody_scroll` và gỡ thuộc tính `width="230%"` trên `table.result_table`.
+ * - Tương phản cao WCAG AAA cho tiêu đề sticky (nền xanh đậm #005b9e + chữ trắng #ffffff,
+ *   khắc phục triệt để lỗi chữ trắng trên nền xanh nhạt #d9eaf7 ở v1).
+ * - Hỗ trợ sticky header cho CẢ `thead th` VÀ `thead td` (eTax dùng `<thead><tr class="result_head"><td>`).
  * - KHÔNG cố định cột bên trái (an toàn tuyệt đối với bảng có dòng tổng hợp `colspan="5"` / `colspan="13"`).
  */
 const ETAX_TABLE_CSS = `
@@ -4990,6 +5262,8 @@ const ETAX_TABLE_CSS = `
 #onday_layer_all {
   max-height: 74vh !important;
   overflow: auto !important;
+  border: 1px solid #b8cde0;
+  background: #ffffff;
 }
 table.result_table,
 table.table_format {
@@ -5008,19 +5282,42 @@ table.result_table thead th,
 table.result_table thead td,
 table.table_format thead th,
 table.table_format thead td {
-  position: sticky !important;
-  top: 0 !important;
-  z-index: 6 !important;
+  background-color: #005b9e !important;
+  background-image: none !important;
+  color: #ffffff !important;
+  font-weight: 600 !important;
+  border: 1px solid rgba(255, 255, 255, 0.28) !important;
   white-space: normal !important;
   word-wrap: break-word !important;
   overflow-wrap: break-word !important;
   background-clip: padding-box;
+  box-shadow: inset 0 -2px 0 #003f70;
+}
+table.result_table thead th *,
+table.result_table thead td *,
+table.table_format thead th *,
+table.table_format thead td * {
+  color: #ffffff !important;
 }
 table.result_table tbody td,
 table.table_format tbody td {
+  color: #0f172a !important;
+  border-color: #d5e0ea !important;
   white-space: normal !important;
   word-wrap: break-word !important;
   overflow-wrap: break-word !important;
+}
+table.result_table tbody tr:nth-child(even) td,
+table.table_format tbody tr:nth-child(even) td {
+  background-color: #f4f8fc !important;
+}
+table.result_table tbody tr:hover td,
+table.table_format tbody tr:hover td {
+  background-color: #e6f2ff !important;
+}
+table.result_table tbody td a:not(.btn),
+table.table_format tbody td a:not(.btn) {
+  color: #005599 !important;
 }
 `;
 
@@ -5082,25 +5379,6 @@ function createTableEnhancerFeature() {
       if (colCount >= 14) {
         rememberInlineStyle(table, 'min-width');
         table.style.minWidth = `${Math.min(colCount * 82, 1650)}px`;
-      }
-
-      // Đảm bảo nền đặc cho các ô tiêu đề sticky (lấy đúng màu nền gốc của dòng .result_head)
-      const headRow = table.querySelector('thead tr');
-      if (headRow) {
-        const computedBg = window.getComputedStyle(headRow).backgroundColor;
-        const solidBg =
-          computedBg && computedBg !== 'rgba(0, 0, 0, 0)' && computedBg !== 'transparent'
-            ? computedBg
-            : '#d9eaf7';
-
-        const allHeadCells = table.querySelectorAll('thead th, thead td');
-        for (const cell of allHeadCells) {
-          const cellBg = window.getComputedStyle(cell).backgroundColor;
-          if (!cellBg || cellBg === 'rgba(0, 0, 0, 0)' || cellBg === 'transparent') {
-            rememberInlineStyle(cell, 'background-color');
-            cell.style.backgroundColor = solidBg;
-          }
-        }
       }
     }
   };
